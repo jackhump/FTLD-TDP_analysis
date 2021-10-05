@@ -1,0 +1,561 @@
+
+---
+title: "Differential Gene Expression"
+subtitle: "C9orf72 vs Control"
+author: "Rahat Hasan"
+date: "February 14, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1700px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, include=FALSE, results='hide'}
+library("knitr")
+library("tidyverse")
+library("limma")
+library("stats")
+library("ggfortify")
+library("gplots")
+library("factoextra")
+library("ggpubr")
+library("egg")
+library(magrittr)
+library(limma)
+library(edgeR)
+library(data.table)
+library(tidyverse)
+library(dplyr)
+library(ggpmisc)
+library(UpSetR)
+
+knitr::opts_chunk$set( 
+  warning=FALSE,
+  message=FALSE,
+  results = 'asis',
+  error = FALSE,
+  tidy = FALSE,
+  fig.show = "hold")
+```
+
+
+```{r combine_metrics, include=FALSE}
+combine_metrics <- function(t, cat=TRUE){  
+  ##Combines clinical and technical metrics into one dataframe. 'cat'=TRUE/FALSE includes or excludes categoricals
+  inFile <- here::here(paste0("data/support/", t, ".RData"))
+  #stopifnot(file.exists(inFile))
+  load(inFile)
+  
+  row.names(support_loc) <- support_loc$sample
+  row.names(tech_loc) <- tech_loc$sample
+  
+  libsize <- enframe(colSums(counts_loc)) %>% dplyr::rename(sample = name, total_counts = value) 
+  
+  support_loc <- dplyr::left_join(support_loc, libsize, by = 'sample')
+  
+  if(cat==FALSE){
+    support_loc <- select(support_loc, sample, disease, where(is.numeric))
+  }
+  
+  tech_loc <- select(tech_loc, sample, where(is.numeric))
+  
+  metric_df <- left_join(support_loc, tech_loc, by = c("sample"="sample"))
+  metric_df <- metric_df[, colSums(is.na(metric_df)) != nrow(metric_df)]
+  metric_df <- metric_df[, apply(metric_df, 2, function(x) replace_na(sd(x)>0, TRUE))] 
+  
+  return(metric_df)
+}
+```
+
+
+# Sample Size 
+```{r sample_size_allftd, echo=FALSE, warning=FALSE}
+rna_tech <- read_tsv("../rna_technical_metrics.tsv") %>%
+  dplyr::rename(sample = external_sample_id) %>%
+  dplyr::select(sample, starts_with('pct'), starts_with('median'), mean_read_length, strand_balance, estimated_library_size)
+
+rna_metadata <- read_tsv(here::here("../rna_support.tsv")) %>%
+  mutate(age = replace_na(age, median(age, na.rm = TRUE)),
+        pmi = replace_na(pmi, median(pmi, na.rm = TRUE)) ) %>%
+  filter(QC_PASS== TRUE,
+         rin > 5,
+         tissue == 'Cerebellum' | tissue == 'Frontal_Cortex' | tissue == 'Temporal_Cortex',
+         disease == 'FTD' | disease == 'Control',
+         site == 'University College London', 
+         is.na(pathology) | pathology != "FTD-FUS" & pathology != "FTD-TAU",
+         sample != "CGND-HRA-00902") ##Removes FTD-FUS and TAU samples (18)
+
+
+rna_metadata$disease <- factor(rna_metadata$disease, levels = c("Control", "FTD"))
+
+table(rna_metadata$disease_c9, rna_metadata$tissue) %>%
+  cbind(apply(., 1, sum)) %>% 
+  rbind(apply(., 2, sum)) %>% 
+  knitr::kable() %>%
+  print()
+
+```
+
+
+```{r all_models, include=FALSE}
+
+models_cere_C9FTD <- list(
+    
+    model_1 = formula(~disease_c9 + sex + age + pct_r2_transcript_strand_reads + median_5prime_bias + pct_ribosomal_bases),
+
+    model_2 = formula(~disease_c9 + sex + age + pct_r2_transcript_strand_reads + median_5prime_bias),
+
+    model_3 = formula(~disease_c9 + sex + age + pct_r2_transcript_strand_reads ),
+
+    model_4 = formula(~disease_c9 + sex + age),
+    
+    model_5 = formula(~disease_c9 + sex + age + median_3prime_bias ),
+
+    model_6 = formula(~disease_c9 + sex + age + median_3prime_bias + pct_coding_bases)
+    )
+
+
+models_fc_C9FTD <- list(
+
+      model_1 = formula(~disease_c9 + age + sex + median_3prime_bias + pct_coding_bases + pct_ribosomal_bases),
+
+      model_2 = formula(~disease_c9 + age + sex + median_3prime_bias + pct_coding_bases),
+
+      model_3 = formula(~disease_c9 + age + sex + median_3prime_bias),
+
+      model_4 = formula(~disease_c9 + age + sex  ),
+      
+      model_5 = formula(~disease_c9 + age + sex + pct_r1_transcript_strand_reads),
+      
+      model_6 = formula(~disease_c9 + age + sex + pct_r1_transcript_strand_reads + pct_utr_bases),
+      
+      model_7 = formula(~disease_c9 + age + sex + pct_r1_transcript_strand_reads + pct_utr_bases + pct_coding_bases),
+      
+      model_8 = formula(~disease_c9 + age + sex + pct_r1_transcript_strand_reads + pct_utr_bases + pct_coding_bases + total_counts)
+      
+      )
+
+models_tc_C9FTD <- list(
+      
+      model_1 = formula(~disease_c9 + age + sex + median_3prime_bias + pct_intronic_bases + pct_ribosomal_bases),
+      
+      model_2 = formula(~disease_c9 + age + sex + median_3prime_bias + pct_intronic_bases),
+      
+      model_3 = formula(~disease_c9 + age + sex + median_3prime_bias),
+      
+      model_4 = formula(~disease_c9 + age + sex ),
+      
+      model_5 = formula(~disease_c9 + age + sex + pct_r2_transcript_strand_reads),
+      
+      model_6 = formula(~disease_c9 + age + sex + pct_r2_transcript_strand_reads + pct_intronic_bases),
+      
+      model_7 = formula(~disease_c9 + age + sex + pct_r2_transcript_strand_reads + pct_intronic_bases + pct_ribosomal_bases)
+
+)
+
+
+```
+
+# Differential Expression 
+```{r diff_expr, echo=TRUE, message=FALSE, warning=FALSE, results='asis'}
+diff_expr <- function(t, design, coef){
+  inFile <- here::here(paste0("data/support/", t, ".RData"))
+  #stopifnot(file.exists(inFile))
+  load(inFile)
+  
+  all_metrics <- combine_metrics(t, cat=TRUE)
+  
+  dge <- DGEList(counts=counts_loc, samples=all_metrics)
+
+  cpm = cpm(dge)
+
+  isexpr <- rowSums(cpm>1) >= 0.9 * ncol(dge)
+
+  dge <- dge[isexpr,]
+  dge <- calcNormFactors(dge, method = "TMM")
+
+  model <- model.matrix(design, data=all_metrics)
+  
+  v <- voom(dge, model)
+  
+  vfit <- lmFit(v, model)
+  efit <- eBayes(vfit)
+
+  top_table <- topTable(efit, adjust="BH", coef=coef, number=Inf, sort.by="logFC")
+
+  decide_table <- decideTests(efit, p.value  = "0.05", adjust.method = "BH")
+  
+  top_table <- merge(top_table, select(as.data.frame(decide_table), contains("disease")), by = "row.names") %>% column_to_rownames(var="Row.names")
+  
+  return(list(top_table, decide_table))
+}
+
+```
+
+```{r tabulate_dge_counts, include=FALSE}
+
+tabulate_dge_counts <- function(t, model_no, comparison, show_disease_counts = TRUE ){
+  comparison <- paste0("_", comparison, "_")
+  model <- paste0("model_", model_no)
+  inFile <- here::here(paste0("data/model_designs/", t, comparison, model, ".RData"))
+  load(inFile)
+  all_metrics <- combine_metrics(t, cat=TRUE)
+  
+  diff_expr_tables[[2]] %>% summary() %>% t() %>% return()
+  
+}
+
+```
+
+```{r eval=FALSE, include=FALSE}
+# Save the models
+tissues <- c("Cerebellum", "Frontal_Cortex", "Temporal_Cortex")
+
+model_list_C9FTD <- list(models_cere_C9FTD, models_fc_C9FTD, models_tc_C9FTD)
+
+for(i in map2(.x=tissues, .y=model_list_C9FTD, ~{c(.x, .y)})){
+   for(n in c(2:length(i)-1)){
+     model <- paste0("model", "_", n)
+     diff_expr_tables <- diff_expr(i[[1]], i[[model]], 2)
+     save(diff_expr_tables, file=paste0(getwd(), "/model_designs/", i[[1]], "_C9FTD_vs_Control_", model, ".RData" ))
+   
+   }
+}
+
+for(i in map2(.x=tissues, .y=model_list_C9FTD, ~{c(.x, .y)})){
+   for(n in c(2:length(i)-1)){
+     model <- paste0("model", "_", n)
+     diff_expr_tables <- diff_expr(i[[1]], i[[model]], 3)
+     save(diff_expr_tables, file=paste0(getwd(), "/model_designs/", i[[1]], "_nonC9FTD_vs_Control_", model, ".RData" ))
+   
+   }
+}
+
+```
+
+## Cerebellum {.tabset .tabset-fade .tabset-pills}
+### Model 1 {.tabset .tabset-fade .tabset-pills}
+```{r cere_m1, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+
+tabulate_dge_counts(t="Cerebellum", comparison = "C9FTD_vs_Control", model_no="1" )%>%
+ kable(caption = 'c9FTD') 
+```
+### Model 2 {.tabset .tabset-fade .tabset-pills}
+```{r cere_m2, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Cerebellum", comparison = "C9FTD_vs_Control", model_no="2" )%>%
+ kable(caption = 'c9FTD') 
+```
+### Model 3 {.tabset .tabset-fade .tabset-pills}
+```{r cere_m3, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Cerebellum", comparison = "C9FTD_vs_Control", model_no="3" )%>%
+ kable(caption = 'c9FTD') 
+```
+### Model 4 {.tabset .tabset-fade .tabset-pills}
+```{r cere_m4, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Cerebellum", comparison = "C9FTD_vs_Control", model_no="4" )%>%
+ kable(caption = 'c9FTD') 
+```
+### Model 5 {.tabset .tabset-fade .tabset-pills}
+```{r cere_m5, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Cerebellum", comparison = "C9FTD_vs_Control", model_no="5" )%>%
+ kable(caption = 'c9FTD') 
+```
+### Model 6 {.tabset .tabset-fade .tabset-pills}
+```{r cere_m6, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Cerebellum", comparison = "C9FTD_vs_Control", model_no="6" )%>%
+ kable(caption = 'c9FTD') 
+```
+
+
+## Frontal Cortex {.tabset .tabset-fade .tabset-pills}
+### Model 1 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m1, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="1" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 2 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m2, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="2" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 3 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m3, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="3" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 4 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m4, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="4" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 5 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m5, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="5" )%>%
+ kable(caption = 'c9FTD') 
+```
+
+### Model 6 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m6, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="6" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 7 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m7, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="7" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 8 {.tabset .tabset-fade .tabset-pills}
+```{r fc_m8, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Frontal_Cortex", comparison = "C9FTD_vs_Control", model_no="8" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+## Temporal Cortex {.tabset .tabset-fade .tabset-pills}
+### Model 1 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m1, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="1" )%>%
+ kable(caption = 'c9FTD') 
+
+```
+
+### Model 2 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m2, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="2" )%>%
+ kable(caption = 'c9FTD') 
+
+
+```
+
+### Model 3 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m3, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="3" )%>%
+ kable(caption = 'c9FTD') 
+
+
+```
+
+### Model 4 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m4, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="4" )%>%
+ kable(caption = 'c9FTD') 
+
+
+```
+
+### Model 5 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m5, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="5" )%>%
+ kable(caption = 'c9FTD') 
+
+
+```
+
+### Model 6 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m6, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="6" )%>%
+ kable(caption = 'c9FTD') 
+
+
+```
+
+### Model 7 {.tabset .tabset-fade .tabset-pills}
+```{r tc_m7, echo=FALSE, fig.height=6, fig.width=6, warning=FALSE, cache=FALSE, res=300}
+tabulate_dge_counts(t="Temporal_Cortex", comparison = "C9FTD_vs_Control",  model_no="7" )%>%
+ kable(caption = 'c9FTD') 
+
+
+```
+
+# C9FTD vs nonC9FTD 
+Compare the simplest models (model 4)
+```{r model_overlap, warning=FALSE, cache=FALSE, include=FALSE, fig.width=5, fig.height=6}
+compare_model <- function(t, comparison, models_x, models_y, xlab="", ylab="", label_c9=TRUE){
+  plot_list <- list()
+  
+  if(length(comparison)==1){
+    comp_x <- comparison %>% paste0("_", ., "_")
+    comp_y <- comparison %>% paste0("_", ., "_")
+  } else
+  if(length(comparison)==2){
+    comp_x <- comparison[1] %>% paste0("_", ., "_")
+    comp_y <- comparison[2] %>% paste0("_", ., "_")
+  }
+
+  plot_list <- 
+    map2(.x=models_x, .y=models_y, ~{
+    y_string <- paste0("model_", .y)
+    load(here::here(paste0("data/model_designs/", t, comp_y, y_string, ".RData")))
+    model_y <- diff_expr_tables[[1]] %>% dplyr::select("logFC")
+    
+    x_string <- paste0("model_", .x)
+    load(here::here(paste0("data/model_designs/", t, comp_x, x_string, ".RData")))
+    model_x <- diff_expr_tables[[1]] %>% dplyr::select("logFC")
+    
+    models_xy <- merge(model_x, model_y, by=0, all=TRUE)
+
+
+    plot <- 
+      ggplot(models_xy, aes(x=logFC.x,y=logFC.y))+
+        xlab(xlab) +
+        ylab(ylab) + 
+        geom_smooth(method=lm, se=FALSE)+
+        geom_hline(linetype="dashed", yintercept=0)+geom_vline(linetype="dashed", xintercept=0)+
+        geom_hex(bins=100, show.legend=FALSE)+
+        stat_cor(color="black", method="spearman")+
+        scale_x_continuous(limits=symmetric_limits)+
+        scale_y_continuous(limits=symmetric_limits)+
+        scale_fill_continuous(type="viridis") +
+        theme_bw()+
+        theme(
+          axis.text=element_text(color="black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          axis.line = element_line(size=0.5)
+        )
+    
+    if(label_c9==TRUE){
+      c9 <- models_xy %>% filter(Row.names=="ENSG00000147894")
+      plot <- plot + 
+        geom_label(data=c9, label="C9orf72", nudge_x=-0.1, nudge_y=0.1)+
+        geom_point(data=c9, color= "red", size=1)
+    }
+    return(plot)
+    
+    
+  })
+
+  egg::ggarrange(plots=plot_list, ncol=3)
+
+}
+
+```
+
+
+## Log-fold correlations
+
+### Frontal Cortex
+```{r model_overlap_fc, echo=FALSE, fig.height=7, fig.width=12, warning=FALSE, cache=FALSE}
+compare_model("Frontal_Cortex", c("C9FTD_vs_Control", "nonC9FTD_vs_Control"), "4", "4", xlab="C9FTLD vs Control", ylab="nonC9FTLD vs Control")
+
+```
+
+### Temporal Cortex
+```{r model_overlap_tc, echo=FALSE, fig.height=7, fig.width=12, warning=FALSE, cache=FALSE}
+compare_model("Temporal_Cortex", c("C9FTD_vs_Control", "nonC9FTD_vs_Control"), "4", "4", xlab="C9FTLD vs Control", ylab="nonC9FTLD vs Control")
+```
+
+### Cerebellum
+```{r model_overlap_cb, echo=FALSE, fig.height=7, fig.width=12, warning=FALSE, cache=FALSE}
+compare_model("Cerebellum", c("C9FTD_vs_Control", "nonC9FTD_vs_Control"), "4", "4", xlab="C9FTLD vs Control", ylab="nonC9FTLD vs Control")
+
+```
+
+## Gene overlaps
+### Frontal Cortex
+```{r gene_int_fc, echo=FALSE}
+
+fc_c9 <- 
+  load("data/model_designs/Frontal_Cortex_C9FTD_vs_Control_model_4.RData") %>%
+  get() %>% 
+  .[[2]] %>% 
+  .[,c(2)] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+  
+fc_nonc9 <- 
+  load("data/model_designs/Frontal_Cortex_nonC9FTD_vs_Control_model_4.RData") %>%
+  get() %>% 
+  .[[2]] %>% 
+  .[,c(3)] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+
+# Most of the genes overlap in the frontal cortex
+left_join(fc_c9, fc_nonc9, by="gene") %>% mutate_if(is.numeric, abs) %>% UpSetR::upset() 
+```
+
+### Temporal Cortex
+```{r gene_int_tc, echo=FALSE}
+tc_c9 <- 
+  load("data/model_designs/Temporal_Cortex_C9FTD_vs_Control_model_4.RData") %>%
+  get() %>% 
+  .[[2]] %>% 
+  .[,c(2)] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+  
+tc_nonc9 <- 
+  load("data/model_designs/Temporal_Cortex_nonC9FTD_vs_Control_model_4.RData") %>%
+  get() %>% 
+  .[[2]] %>% 
+  .[,c(3)] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+
+left_join(tc_c9, tc_nonc9, by="gene") %>% mutate_if(is.numeric, abs) %>% UpSetR::upset()
+```
+
+### Cerebellum
+```{r gene_int_cb, echo=FALSE}
+
+cb_c9 <- 
+  load("data/model_designs/Cerebellum_C9FTD_vs_Control_model_4.RData") %>%
+  get() %>% 
+  .[[2]] %>% 
+  .[,c(2)] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+  
+cb_nonc9 <- 
+  load("data/model_designs/Cerebellum_nonC9FTD_vs_Control_model_4.RData") %>%
+  get() %>% 
+  .[[2]] %>% 
+  .[,c(3)] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+
+left_join(cb_c9, cb_nonc9, by="gene") %>% mutate_if(is.numeric, abs) %>% UpSetR::upset()
+```
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,161 @@
+
+---
+title: "Von-economo neurons and matrix metalloproteinases"
+author: "Rahat Hasan"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(tidyverse)
+library(ggforce)
+```
+
+# VEN marker gene expression
+```{r echo=TRUE, fig.height=5, fig.width=12, message=FALSE, warning=FALSE}
+gene_meta <- 
+  read_tsv("../FTD_dtu/data/gencode.v30.tx2gene.tsv.gz") %>% 
+  janitor::clean_names() %>%
+  dplyr::rename(isoform_id=txname, gene_id=geneid, gene=genename) %>%
+  mutate(isoform_id=str_split_fixed(isoform_id, "\\.", 2)[,1], gene_id=str_split_fixed(gene_id, "\\.", 2)[,1]) %>%
+  distinct()
+
+ve_markers <- read_csv("data/von_economo_markers.csv")
+
+fc_degs <-
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData") %>%
+  get() %>% 
+  .[[1]] %>%
+  mutate(tissue="Frontal Cortex") %>%
+  rownames_to_column("gene_id") %>%
+  left_join(dplyr::select(gene_meta, c("gene", "gene_id")), by="gene_id") %>%
+  distinct(gene, .keep_all=TRUE) 
+
+tc_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData") %>% 
+  get() %>%
+  .[[1]] %>%
+  mutate(tissue="Temporal Cortex") %>%
+  rownames_to_column("gene_id") %>%
+  left_join(dplyr::select(gene_meta, c("gene", "gene_id")), by="gene_id") %>%
+  distinct(gene, .keep_all=TRUE) 
+  
+ve_degs <- 
+  rbind(fc_degs, tc_degs) %>%
+  group_by(tissue) %>%
+  arrange(logFC, .by_group = TRUE) %>%
+  left_join(ve_markers, by="gene") %>%
+  distinct(gene, .keep_all=TRUE) %>%
+  filter(!is.na(term_id)) 
+
+ve_degs$gene <- factor(ve_degs$gene, levels=unique(ve_degs$gene))
+
+ve_degs %>%
+  mutate(direction=ifelse(logFC>0, "Up", "Down")) %>%
+  ggplot(aes(x=logFC, y=gene, fill=direction))+
+  geom_bar(stat="identity")+
+  geom_text(aes(x=ifelse(logFC>0, logFC+0.07, logFC-0.07),
+                label=ifelse(adj.P.Val<0.05, "*", 
+                           ifelse(adj.P.Val<0.01, "**", 
+                                  ifelse(adj.P.Val<0.001, "***", "")))), size=5)+
+  scale_fill_manual(values=c("#00bfc4", "#f8766d"))+
+  xlab("logFC")+
+  ylab(NULL)+
+  ggtitle("Von Economo neurons", subtitle="Hodge et al 2021")+
+  facet_wrap(~tissue)+
+  theme_bw()+
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(color="black"),
+      legend.position = "bottom",
+      axis.text = element_text(color="black"),
+      axis.text.y=element_text(face="italic"),
+      #panel.border = element_blank(),
+      panel.grid.major=element_blank(),
+      panel.grid.minor=element_blank())
+
+  
+```
+
+# MMP expression
+```{r}
+cb_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Cerebellum_allFTD_vs_Control_model_2.RData") %>% 
+  get() %>%
+  .[[1]] %>%
+  mutate(tissue="Cerebellum") %>%
+  rownames_to_column("gene_id") %>%
+  left_join(dplyr::select(gene_meta, c("gene", "gene_id")), by="gene_id") %>%
+  distinct(gene, .keep_all=TRUE) 
+
+mmps <-
+  rbind(fc_degs, tc_degs) %>%
+  rbind(cb_degs) %>%
+  group_by(tissue) %>%
+  filter(grepl("^MMP\\d*$", gene)) %>%
+  arrange(logFC, .by_group = TRUE) 
+
+
+mmps <- 
+  read_csv(file="C:/Users/hasan/OneDrive/Desktop/mmps.csv") %>%
+  rbind(cb_degs) %>%
+  #group_by(tissue) %>%
+  filter(grepl("^MMP\\d*$", gene)) %>%
+  arrange(logFC, .by_group = TRUE) 
+
+
+genes_ordered <- aggregate(data=mmps, logFC ~ tissue + gene, mean) %>% filter(tissue != "Cerebellum") %>% arrange(logFC) %>% .$gene
+
+mmps$gene <- factor(mmps$gene, levels=unique(genes_ordered))
+
+mmps$tissue <- factor(mmps$tissue, c("Frontal Cortex", "Temporal Cortex", "Cerebellum"))
+
+
+
+mmps %>%
+  mutate(direction=ifelse(logFC>0, "Up", "Down")) %>%
+  ggplot(aes(x=logFC, y=gene, fill=direction))+
+  geom_bar(stat="identity")+
+  geom_text(aes(x=ifelse(logFC>0, logFC+0.07, logFC-0.07),
+                label=ifelse(adj.P.Val<0.05, "*", 
+                           ifelse(adj.P.Val<0.01, "**", 
+                                  ifelse(adj.P.Val<0.001, "***", "")))), size=5)+
+  scale_fill_manual(values=c("#00bfc4", "#f8766d"))+
+  xlab("logFC")+
+  ylab(NULL)+
+  ggtitle("MMPs")+
+  facet_wrap(~tissue)+
+  theme_bw()+
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(color="black"),
+      legend.position = "bottom",
+      axis.text = element_text(color="black"),
+      axis.text.y=element_text(face="italic"),
+      panel.grid.major=element_blank(),
+      panel.grid.minor=element_blank())
+
+
+```
+
+

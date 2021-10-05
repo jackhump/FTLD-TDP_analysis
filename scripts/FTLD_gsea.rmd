@@ -1,0 +1,526 @@
+
+---
+title: "Gene Set Enrichment Analysis (GSEA)"
+subtitle: "allFTD vs Control"
+author: "Rahat Hasan"
+date: "February 11, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1600px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+library(tidyverse)
+library(patchwork)
+library(homologene)
+library(clusterProfiler)
+library(UpSetR)
+
+
+knitr::opts_chunk$set( 
+  warning=FALSE,
+  message=FALSE,
+  results = 'asis',
+  error = FALSE,
+  tidy = FALSE,
+  fig.show = "hold")
+
+theme_rh <- function (){ 
+  theme_bw()+
+  theme(
+  legend.position="right",
+  legend.key.size = unit(0.65, "cm"),
+  panel.grid.major=element_blank(),
+  panel.grid.minor=element_blank(),
+  panel.border=element_rect(color="black", fill=NA, size=0.5),
+  axis.text.x=element_text(color="black"),
+  axis.text.y=element_text(color="black"),
+  panel.background=element_rect(fill="gray90"),
+  panel.spacing = unit(0, "npc"),
+  strip.background=element_blank(),
+  strip.text.x=element_blank(),
+  strip.placement="right")
+}
+
+
+createDT <- function(DF, caption="", scrollY=500){
+  data <- DT::datatable(DF, caption=caption,
+    extensions =  'Buttons',
+    options = list( dom = 'Bfrtip', 
+                    buttons = c('copy', 'csv', 'excel', 'pdf', 'print'), 
+                    scrollY = scrollY, scrollX=T, scrollCollapse = T, paging = F,  
+                      columnDefs = list(list(className = 'dt-center', targets = "_all"))
+    )
+  ) 
+   return(data)
+}
+
+## GSEA
+named_list_to_df <- function(named_list){
+  map2_df( named_list, names(named_list), ~{
+    tibble( term_id = .y, gene = .x)
+  } )
+}
+
+
+multi_tissue_de <- function(tissues, disease_comp, model_no){
+  disease_comp <- paste0("_", disease_comp, "_")
+  de_list <- map2(.x=tissues, .y=model_no, ~{
+    load(paste0("../FTD_differential_expression/data/model_designs/", .x, disease_comp, "model_", .y, ".RData"))
+    res <- diff_expr_tables[[1]]
+    res <- res %>% as.data.frame()
+    res <- rownames_to_column(res, "gene_id" )
+  })
+  names(de_list) <- tissues
+
+  return(de_list)
+}
+
+tissues <- c("Cerebellum", "Frontal_Cortex", "Temporal_Cortex")
+
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+de_res <- multi_tissue_de(tissues, disease_comp="allFTD_vs_Control", model_no=c("2", "3", "1"))
+
+de_res <- 
+  purrr::map2(
+  .x = de_res,
+  .y = names(de_res), ~{
+  .x$tissue <- .y
+  symbols <- bitr(.x$gene_id, fromType="ENSEMBL", toType=c("SYMBOL"), OrgDb="org.Hs.eg.db")
+  ind <- match(.x$gene_id, symbols$ENSEMBL)
+  .x$genename <- symbols$SYMBOL[ind]
+  return(.x)
+})
+
+gene_sets_sig <- 
+  map_df(de_res, ~{.x}) %>%
+  mutate(direction = ifelse( logFC > 0, "up", "down") ) %>%
+  mutate( set = paste(tissue, direction, sep = ":")) %>%
+  filter(adj.P.Val < 0.05) %>%
+  split(.$set) %>%
+  map("genename")
+
+gene_sets_top <-
+  map_df(de_res, ~{.x}) %>%
+  mutate(direction = ifelse( logFC > 0, "up", "down") ) %>%
+  mutate( set = paste(tissue, direction, sep = ":")) %>%
+  split(.$set) %>%
+  map("genename") %>%
+  map( ~{ head(.x, 250)})
+
+gene_sets_tstat <-
+  map(de_res, ~{
+    .x <- arrange(.x, desc(t) )
+    tstat <- .x$t
+    names(tstat) <- .x$genename
+    return(tstat)
+  })
+
+
+```
+
+# MSigDB Hallmark GSEA
+```{r hallmark_gsea, echo=TRUE, fig.height=8, fig.width=7, message=FALSE, warning=FALSE}
+
+hallmark_file <- "data/h.all.v7.2.symbols.gmt"
+
+hallmarks <- read.gmt(hallmark_file) %>%
+    mutate(term = gsub("HALLMARK|_", " ", term))
+
+hallmark_res <- 
+  map_df(gene_sets_sig, ~{
+    as.data.frame(enricher(.x, TERM2GENE=hallmarks))
+  }, .id = "set"
+  )
+
+hallmark_gsea_res <- map_df(gene_sets_tstat, ~{
+  as.data.frame(GSEA(.x, TERM2GENE = hallmarks, pvalueCutoff = 1))
+}, .id = "set")
+
+
+hallmark_gsea_res$ID <- substring(hallmark_gsea_res$ID, 3)
+hallmark_gsea_res$Description <- substring(hallmark_gsea_res$Description, 3)
+
+hallmark_gsea_res <- read_csv("data/hallmark_gsea_res.csv")
+
+pathways_ordered <- c("EPITHELIAL MESENCHYMAL TRANSITION", 
+                      "COAGULATION", 
+                      "ANGIOGENESIS", 
+                      "G2M CHECKPOINT", 
+                      "IL6 JAK STAT3 SIGNALING",
+                      "TNFA SIGNALING VIA NFKB", 
+                      "INFLAMMATORY RESPONSE",
+                      "ALLOGRAFT REJECTION", 
+                      "COMPLEMENT",
+                      "P53 PATHWAY",
+                      "APOPTOSIS",
+                      "INTERFERON GAMMA RESPONSE",
+                      "IL2 STAT5 SIGNALING",
+                      "MYC TARGETS V1",
+                      "HYPOXIA",
+                      "XENOBIOTIC METABOLISM",
+                      "PROTEIN SECRETION",
+                      "ADIPOGENESIS",
+                      "HEME METABOLISM",
+                      "MTORC1 SIGNALING",
+                      "PI3K MTOR SIGNALING",
+                      "KRAS SIGNALING UP", 
+                      "INTERFERON ALPHA RESPONSE",
+                      "MITOTIC SPINDLE",
+                      "CHOLESTEROL HOMEOSTASIS", 
+                      "KRAS SIGNALING DN", 
+                      "OXIDATIVE PHOSPHORYLATION")
+
+hallmark_gsea_res$Description <- factor(hallmark_gsea_res$Description, levels=rev(pathways_ordered))
+
+hallmark_gsea_res$set <- factor(hallmark_gsea_res$set, levels=c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum"))
+
+
+hallmark_gsea_res %>%
+  filter(Description %in% pathways_ordered) %>%
+  ggplot(mapping=aes(x=set, y=Description, fill=NES))+
+  geom_tile()+
+  labs(fill="NES")+
+  theme_rh()+
+  scale_fill_gradient2(low="dodgerblue", mid="white", high="red", midpoint=0, aesthetics="fill", guide="colourbar", na.value="gray85", limits=c(-3,3))+
+  scale_x_discrete(expand=c(0,0), position="top")+ 
+  scale_y_discrete(expand=c(0,0))+
+  geom_text(aes(label=ifelse(p.adjust<0.05, "*", 
+                             ifelse(p.adjust<0.01, "**", 
+                                    ifelse(p.adjust<0.001, "***", "")))), size=6.2, nudge_y = -0.1)+
+  xlab(NULL)+
+  ylab(NULL)
+
+```
+
+# Neuroexpresso GSEA 
+```{r nxp_gsea, echo=TRUE, fig.height=6, fig.width=6, message=FALSE, warning=FALSE}
+
+nxp_cortex_files <- list.files("data/neuroexpresso/Cortex_combined", full.names = TRUE)
+cortex_cell_types <- basename(nxp_cortex_files)
+
+nxp_cere_files <- list.files("data/neuroexpresso/Cerebellum_combined/", full.names = TRUE)
+cere_cell_types <- basename(nxp_cere_files)
+
+
+nxp_cortex <- purrr::map(nxp_cortex_files, ~{
+  mouse_genes <- readLines(.x) 
+  human_homologene <- homologene::homologene(mouse_genes, inTax = 10090, outTax = 9606 )
+  human_homologene <- human_homologene[!duplicated(human_homologene) | !duplicated(human_homologene),]$`9606`  
+  return(human_homologene)
+})
+
+nxp_cere <- purrr::map(nxp_cere_files, ~{
+  mouse_genes <- readLines(.x) 
+  human_homologene <- homologene::homologene(mouse_genes, inTax = 10090, outTax = 9606 )
+  human_homologene <- human_homologene[!duplicated(human_homologene) | !duplicated(human_homologene),]$`9606`  
+  return(human_homologene)
+})
+
+names(nxp_cortex) <- basename(nxp_cortex_files)
+names(nxp_cere) <- basename(nxp_cere_files)
+
+nxp_cortex <- nxp_cortex[cortex_cell_types]
+nxp_cere <- nxp_cere[cere_cell_types]
+
+nxp_cortex_ont <- named_list_to_df(nxp_cortex) 
+nxp_cere_ont <- named_list_to_df(nxp_cere) 
+
+
+nxp_gsea_res <- map_df(gene_sets_tstat, ~{
+  if(length(.x)==length(gene_sets_tstat$Cerebellum)){
+   as.data.frame(GSEA(.x, TERM2GENE = nxp_cere_ont,pvalueCutoff = 1))
+  } else {
+   as.data.frame(GSEA(.x, TERM2GENE = nxp_cortex_ont,pvalueCutoff = 1))
+  }
+  
+}, .id = "set") %>%
+  arrange(NES)
+
+nxp_gsea_res <-
+  read_csv("data/nxp_gsea_res.csv") %>% arrange(NES)
+
+nxp_gsea_res$set <- factor(nxp_gsea_res$set, levels=c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum"))
+nxp_gsea_res$Description <- factor(nxp_gsea_res$Description, levels=unique(nxp_gsea_res$Description))
+
+nxp_gsea_res %>%
+  ggplot(mapping=aes(x=set, y=Description, fill=NES))+
+  geom_tile()+
+  theme_rh()+
+  geom_text(aes(label=ifelse(p.adjust<0.05, "*", 
+                            ifelse(p.adjust<0.01, "**", 
+                                  ifelse(p.adjust<0.001, "***", "")))), size=6.2, nudge_y = -0.1)+
+  xlab(NULL)+
+  ylab(NULL)+
+  scale_fill_gradient2(low="dodgerblue", mid="white", high="red", midpoint=0, aesthetics="fill", guide="colourbar", na.value="gray85")+
+  scale_x_discrete(expand=c(0,0), position="top")+ 
+  scale_y_discrete(expand=c(0,0))
+
+```
+
+# Cell-type logFC
+```{r cell-type_logfc, fig.height=5, fig.width=13}
+gene_meta <- 
+  read_tsv("../FTD_dtu/data/gencode.v30.tx2gene.tsv.gz") %>% 
+  janitor::clean_names() %>%
+  dplyr::rename(isoform_id=txname, gene_id=geneid, gene=genename) %>%
+  mutate(isoform_id=str_split_fixed(isoform_id, "\\.", 2)[,1], gene_id=str_split_fixed(gene_id, "\\.", 2)[,1]) %>%
+  distinct()
+
+fc_logfc <- 
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  #filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  dplyr::select(gene, logFC) %>%
+  mutate(tissue="Frontal Cortex")
+
+tc_logfc <- 
+  load("../FTD_differential_expression/data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  #filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  dplyr::select(gene, logFC) %>%
+  mutate(tissue="Temporal Cortex")
+
+cb_logfc <- 
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_2.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  #filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  dplyr::select(gene, logFC) %>%
+  mutate(tissue="Cerebellum")
+
+activation_markers <- 
+  read_tsv("data/activation_gene_lists.tsv")
+
+fc_cell_type_logfc <- fc_logfc %>% left_join(nxp_cortex_ont) %>% drop_na(term_id) %>% dplyr::select("term_id", "gene", "tissue", "logFC") 
+tc_cell_type_logfc <- tc_logfc %>% left_join(nxp_cortex_ont) %>% drop_na(term_id) %>% dplyr::select("term_id", "gene", "tissue", "logFC")
+cb_cell_type_logfc <- cb_logfc %>% left_join(nxp_cere_ont) %>% drop_na(term_id) %>% dplyr::select("term_id", "gene", "tissue", "logFC")
+
+fc_activation_logfc <- fc_logfc %>% left_join(activation_markers) %>% drop_na(term_id) %>% dplyr::select("term_id", "gene", "tissue", "logFC") 
+tc_activation_logfc <- tc_logfc %>% left_join(activation_markers) %>% drop_na(term_id) %>% dplyr::select("term_id", "gene", "tissue", "logFC")
+cb_activation_logfc <- cb_logfc %>% left_join(activation_markers) %>% drop_na(term_id) %>% dplyr::select("term_id", "gene", "tissue", "logFC")
+
+all_cell_type_logfc <- 
+  rbind(fc_cell_type_logfc, tc_cell_type_logfc) %>% rbind(cb_cell_type_logfc) %>%
+  filter(! term_id %in% c("CerebGranule", "Bergmann", "Basket", "OligoPrecursors", "Microglia_deactivation", "Neuron")) %>%
+  drop_na()
+
+all_cell_type_logfc$tissue <- factor(all_cell_type_logfc$tissue, levels=c("Frontal Cortex", "Temporal Cortex", "Cerebellum"))
+
+all_activation_logfc <- 
+  rbind(fc_activation_logfc, tc_activation_logfc) %>%
+  rbind(cb_activation_logfc) 
+
+all_cell_type_logfc %>%
+  ggplot(aes(x=term_id, y=logFC, color=term_id))+
+  geom_boxplot()+
+  geom_jitter(width=0.2, alpha=0.4)+  
+  geom_hline(yintercept=0, linetype="dashed")+
+  ylim(c(-2,2))+
+  xlab("Cell-type")+
+  facet_wrap(~tissue, scales="free_x")+
+  theme_bw()+
+  coord_flip()+
+  theme(
+      legend.position="right",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      text = element_text(color="black"),
+      axis.line = element_line(size=0.3),
+      axis.text.x = element_text(size=7),
+      axis.text.y = element_text(size=7),
+      axis.title.y = element_text(color="black"),
+      strip.background = element_blank(),
+      strip.text = element_text(color="black"),
+      panel.spacing = unit(0.3, "lines")
+      )
+
+```
+
+# Glial activation GSEA
+```{r activation_gsea, fig.height=4.5, fig.width=6}
+
+activation_markers <- 
+  read_tsv("data/activation_gene_lists.tsv") 
+
+microglial_activation_markers_cortex <- 
+  filter(nxp_cortex_ont, term_id=="Microglia_activation") 
+
+microglial_activation_markers_cere<- 
+  filter(nxp_cere_ont, term_id=="Microglia_activation") 
+
+
+activation_res <-
+  map_df(gene_sets_tstat, ~{
+  as.data.frame(GSEA(.x, TERM2GENE = activation_markers,pvalueCutoff = 1))
+  }, .id = "set") 
+
+microglia_activation_res_cortex <-
+  map_df(gene_sets_tstat[-1], ~{
+  as.data.frame(GSEA(.x, TERM2GENE = microglial_activation_markers_cortex,pvalueCutoff = 1))
+  }, .id = "set") 
+
+microglia_activation_res_cere <-
+  map_df(gene_sets_tstat[1], ~{
+  as.data.frame(GSEA(.x, TERM2GENE = microglial_activation_markers_cere,pvalueCutoff = 1))
+  }, .id = "set") 
+
+all_activation_res <- 
+  rbind(activation_res, microglia_activation_res_cere, microglia_activation_res_cortex) %>%
+  mutate(ID=ifelse(ID=="Microglia_activation", "Microglial activation\n(Neuroexpresso)", ID))
+
+all_activation_res$set <- factor(all_activation_res$set, levels=c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum"))
+
+
+all_activation_res$ID <- 
+  factor(all_activation_res$ID, 
+         levels=c("Disease-associated astrocytes\n(Habib, 2020)",
+                      "Reactive astrocytes - MCAO\n(Zamanian, 2012)",
+                      "Reactive astrocytes - LPS\n(Zamanian, 2012)",
+                      "Disease-associated microglia\n(Keren-Shaul, 2017)",
+                      "Microglial activation\n(Neuroexpresso)",
+                      "Plaque-induced genes\n(Chen, 2020)"))
+
+labels <- c("Disease-associated astrocytes",
+                      "Reactive astrocytes - MCAO",
+                      "Reactive astrocytes - LPS",
+                      "Disease-associated microglia",
+                      "Activated microglia",
+                      "Plaque-induced genes")
+
+all_activation_res %>%
+  ggplot(mapping=aes(x=set, y=ID, fill=NES))+
+  geom_tile(width=1, height=1)+
+  geom_text(aes(label=ifelse(p.adjust<0.05, "*", 
+                           ifelse(p.adjust<0.01, "**", 
+                                  ifelse(p.adjust<0.001, "***", "")))), size=6.2, nudge_y = -0.1)+
+  theme_rh()+
+  scale_fill_gradient2(low="dodgerblue", mid="white", high="red", midpoint=0, aesthetics="fill", guide="colourbar", na.value="gray85", limits=c(-3,3))+
+  xlab(NULL)+
+  ylab(NULL)+
+  scale_x_discrete(expand=c(0,0), position="top")+ 
+  scale_y_discrete(expand=c(0,0), labels=labels)
+
+
+```
+
+
+# Glial activation logFC comparisons
+```{r activation_logfc, fig.width=11, fig.height=6}
+
+activation_comparisons <-
+  all_cell_type_logfc %>%
+  filter(term_id %in% c("Astrocyte", "Microglia", "Microglia_activation")) %>%
+  rbind(all_activation_logfc) %>%
+  drop_na()
+
+activated_astrocytes <- c("Disease-associated astrocytes\n(Habib, 2020)", "plaque_induced_genes_astrocytes", "Reactive astrocytes - LPS\n(Zamanian, 2012)", "Reactive astrocytes - MCAO\n(Zamanian, 2012)")
+
+activated_microglia <- c("Disease-associated microglia\n(Keren-Shaul, 2017)", "Plaque-induced genes\n(Chen, 2020)", "Microglia_activation")
+
+activation_comparisons <- 
+  activation_comparisons %>%
+  rbind(
+    mutate(filter(activation_comparisons, term_id=="Plaque-induced genes\n(Chen, 2020)"), term_id="plaque_induced_genes_astrocytes")
+    ) %>%
+  mutate(comparison=ifelse(term_id %in% activated_astrocytes, "Astrocytes",
+                           ifelse(term_id %in% activated_microglia, "Microglia", 
+                             ifelse(term_id == "Astrocyte", "Astrocytes",
+                                    ifelse(term_id=="Microglia", "Microglia", NA)))))
+
+activation_comparisons$term_id <- factor(activation_comparisons$term_id, levels=c("Astrocyte", "Disease-associated astrocytes\n(Habib, 2020)", "Reactive astrocytes - LPS\n(Zamanian, 2012)",  "Reactive astrocytes - MCAO\n(Zamanian, 2012)", "plaque_induced_genes_astrocytes", "Microglia", "Disease-associated microglia\n(Keren-Shaul, 2017)", "Microglia_activation", "Plaque-induced genes\n(Chen, 2020)" ))
+
+activation_labels <- c("Astrocyte", "Disease-associated astrocytes", "Reactive astrocytes - LPS", "Reactive astrocytes - MCAO", "Plaque-induced genes", "Microglia", "Disease-associated microglia", "Activated microglia", "Plaque-induced genes")
+
+activation_comparisons %>%
+  ggplot(aes(x=term_id, y=logFC), show.legend=FALSE)+
+  geom_jitter(width=0.25, size=1.4, aes(color=comparison), alpha=0.4, stroke=0)+
+  geom_hline(yintercept=0, linetype="dashed", color="black")+
+  geom_boxplot(color="black", fill=NA, outlier.shape=NA, lwd=0.3)+
+  ggpubr::stat_compare_means(comparisons=list(c(1,2), c(1,3), c(1,4), c(1,5), c(6,7), c(6,8), c(6,9)), label="p.signif", size=4)+
+  scale_color_manual(values=c("purple", "forestgreen"))+
+  theme_bw()+
+  ylab(expression(paste("log"[2], "(fold change)")))+
+  xlab(NULL)+
+  scale_x_discrete(labels= activation_labels)+
+  facet_wrap(~tissue)+
+  theme(
+    legend.position="top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_blank(),
+    text = element_text(color="black"),
+    #axis.line.y = element_line(color="black"),
+    axis.line = element_line(colour = "black", size=0.3),
+    axis.text.x = element_text(color="black", angle=45, hjust=1),
+    axis.text.y = element_text(color="black"),
+    axis.title.y = element_text(color="black"),
+    strip.background = element_blank(),
+    strip.text = element_text(color="black"),
+    panel.spacing = unit(0.3, "lines")
+    )
+
+```
+
+# Glial and activated glial marker overlaps 
+```{r, fig.width=10, fig.height=8}
+all_glial_markers <- 
+  named_list_to_df(nxp_cortex) %>%
+  filter(term_id %in% c("Astrocyte", "Microglia")) %>%
+  rbind(
+    filter(activation_markers, tissue != "Cerebellum") %>%
+      dplyr::select(-tissue)
+  ) %>%
+  split(.$term_id) %>%
+  map(.f=~{.x$gene})
+
+UpSetR::upset(UpSetR::fromList(all_glial_markers), nsets=8, order.by="freq")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+

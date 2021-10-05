@@ -1,0 +1,355 @@
+
+---
+title: "Differential Gene Expression - PMI"
+author: "Rahat Hasan"
+date: "March 14, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, include=FALSE, results='hide'}
+if(!require("knitr")) install.packages("knitr", repos = c('http://rforge.net', 'http://cran.rstudio.org')); library("knitr")
+if(!require("tidyverse")) BiocManager::install("tidyverse"); library("tidyverse")
+if(!require("limma")) install.packages("limma"); library("limma")
+if(!require("stats")) install.packages("stats"); library("stats")
+if(!require("ggfortify")) install.packages("ggfortify"); library("ggfortify")
+if(!require("gplots")) install.packages("gplots"); library("gplots")
+if(!require("factoextra")) install.packages("factoextra"); library("factoextra")
+if(!require("ggpubr")) install.packages("ggpubr"); library("ggpubr")
+if(!require("plotly")) install.packages("plotly"); library("plotly")
+if(!require("egg")) install.packages("egg"); library("egg")
+if(!require("UpSetR")) install.packages("UpSetR"); library("UpSetR")
+if(!require("attempt")) install.packages("attempt"); library("attempt")
+if(!require("stringr")) install.packages("stringr"); library("stringr")
+if(!require("gtools")) install.packages("gtools"); library("gtools")
+library(magrittr)
+library(limma)
+library(edgeR)
+library(data.table)
+library(tidyverse)
+library(dplyr)
+library(ggpmisc)
+
+knitr::opts_chunk$set( 
+  warning=FALSE,
+  message=FALSE,
+  results = 'asis',
+  error = FALSE,
+  tidy = FALSE,
+  fig.show = "hold")
+```
+
+```{r metadata, message=FALSE, warning=FALSE, include=FALSE}
+rna_tech <- read_tsv("../rna_technical_metrics.tsv") %>%
+  dplyr::rename(sample = external_sample_id) %>%
+  dplyr::select(sample, starts_with('pct'), starts_with('median'), mean_read_length, strand_balance, estimated_library_size)
+
+rna_metadata <- read_tsv(here::here("../rna_support.tsv")) %>%
+  mutate(age = replace_na(age, median(age, na.rm = TRUE)),
+        pmi = replace_na(pmi, median(pmi, na.rm = TRUE)) ) %>%
+  filter(QC_PASS== TRUE,
+         rin > 5,
+         tissue == 'Cerebellum' | tissue == 'Frontal_Cortex' | tissue == 'Temporal_Cortex',
+         disease == 'FTD' | disease == 'Control',
+         site == 'University College London', 
+         is.na(pathology) | pathology != "FTD-FUS" & pathology != "FTD-TAU",
+         sample != "CGND-HRA-00902") ##Removes FTD-FUS and TAU samples (18)
+
+grn_data <- read_csv(here::here("../ucl_brain_bank_pmi_pathology_data_with_key.csv"))
+
+ind <- grepl("GRN", grn_data$mutations_4, fixed = TRUE) | grepl("GRN", grn_data$mutations_24, fixed = TRUE) 
+grn_data <- grn_data[ind,]
+
+ind <- match(grn_data$external_subject_id, rna_metadata$individual) %>% na.omit()
+individuals <- rna_metadata$individual[ind]
+
+samples <- rna_metadata$sample[rna_metadata$individual %in% individuals] 
+
+rna_metadata <- rna_metadata %>% 
+  
+  mutate(mutations = ifelse(sample %in% samples, "GRN", mutations)) %>%
+  
+  mutate(disease_grn = ifelse(disease == "FTD" & mutations == "GRN", "GRN", 
+                        ifelse(disease == "FTD" & mutations != "GRN", "nonGRN", "Control"))) %>%
+  
+  mutate(disease_c9 = ifelse(disease == "FTD" & mutations == "C9orf72", "C9FTD", 
+                        ifelse(disease == "FTD" & mutations != "C9orf72", "nonC9FTD", "Control")))
+
+rna_metadata$disease <- factor(rna_metadata$disease, levels = c("Control", "FTD"))
+
+rna_metadata$disease_grn <- factor(rna_metadata$disease_grn, levels = c("Control", "GRN", "nonGRN"))
+
+rna_metadata$disease_c9 <- factor(rna_metadata$disease_c9, levels = c("Control", "C9FTD", "nonC9FTD"))
+
+```
+
+# PMI Distribution
+```{r pmi_dist, fig.width=10, fig.height=5, echo=FALSE}
+rna_metadata %>%
+  ggplot(aes(x=disease, y=pmi, fill=disease, alpha=0.5))+
+  geom_point()+
+  geom_jitter()+
+  geom_boxplot()+
+  xlab("Disease")+
+  ylab("PMI")+
+  facet_wrap(~tissue)+
+  theme_bw()+
+  stat_compare_means()
+
+```
+
+
+# Differential Expression {.tabset .tabset-fade .tabset-pills}
+Perform differential expression on cases and controls respectively, using PMI as the only variable. Repeat for each tissue.
+```{r diff_expr_pmi, echo=TRUE, message=FALSE, warning=FALSE, cache=TRUE, results='asis'}
+diff_expr_pmi <- function(t, design=formula(~pmi), coef=2, toptable=TRUE, voomtable=FALSE, decidetests=FALSE, sampletype="FTD"){
+  
+  load(here::here(paste0("data/support/", t, ".RData")))
+
+  support_loc <- filter(support_loc, disease==sampletype)
+  
+  counts_loc <- counts_loc[, support_loc$sample]
+  
+  dge <- DGEList(counts=counts_loc, samples=support_loc)
+  
+  cpm = cpm(dge)
+  
+  isexpr <- rowSums(cpm>1) >= 0.9 * ncol(dge)
+  
+  dge <- dge[isexpr,]
+  dge <- calcNormFactors(dge, method = "TMM")
+  
+  model <- model.matrix(design, data=support_loc)
+  
+  v <- voom(dge, model)
+
+  vfit <- lmFit(v, model)
+  efit <- eBayes(vfit)
+  
+  outputs <- list()
+  
+  if(toptable==TRUE){
+    outputs[[length(outputs)+1]] <- topTable(efit, adjust="BH", coef=coef, number=Inf, sort.by="logFC")
+  }
+  
+  if(voomtable==TRUE){
+    outputs[[length(outputs)+1]] <- v$E
+  }
+  
+  if(decidetests==TRUE){
+    outputs[[length(outputs)+1]] <- decideTests(efit, p.value  = "0.05", adjust.method = "BH")
+  }
+  
+  return(outputs)
+
+
+}
+
+```
+
+## Cerebellum {.tabset .tabset-fade .tabset-pills}
+```{r diff_expr_pmi_cere, echo=FALSE, cache=TRUE}
+diff_expr_pmi("Cerebellum", toptable=FALSE, decidetests=TRUE, sampletype="FTD")[[1]] %>%
+summary() %>% t() %>% kable(caption = "FTD Cases") %>% print()
+
+diff_expr_pmi("Cerebellum", toptable=FALSE, decidetests=TRUE, sampletype="Control")[[1]] %>%
+summary() %>% t() %>% kable(caption = "Controls") %>% print()
+```
+
+## Frontal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r diff_expr_pmi_fc, echo=FALSE, cache=TRUE}
+diff_expr_pmi("Frontal_Cortex", toptable=FALSE, decidetests=TRUE, sampletype="FTD")[[1]] %>%
+summary() %>% t() %>% kable(caption = "FTD Cases") %>% print()
+
+diff_expr_pmi("Frontal_Cortex", toptable=FALSE, decidetests=TRUE, sampletype="Control")[[1]] %>%
+summary() %>% t() %>% kable(caption = "Controls") %>% print()
+```
+
+## Temporal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r diff_expr_pmi_tc, echo=FALSE, cache=TRUE}
+diff_expr_pmi("Temporal_Cortex", toptable=FALSE, decidetests=TRUE, sampletype="FTD")[[1]] %>%
+summary() %>% t() %>% kable(caption = "FTD Cases") %>% print()
+
+diff_expr_pmi("Temporal_Cortex", toptable=FALSE, decidetests=TRUE, sampletype="Control")[[1]] %>%
+summary() %>% t() %>% kable(caption = "Controls") %>% print()
+```
+
+
+# LogFC Correlations {.tabset .tabset-fade .tabset-pills}
+After performing differential expression on the cases and controls respectively, correlate the log-fold changes of the PMI genes with the log-fold changes of the FTD genes.
+```{r logfc_correlations, echo=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+
+correlate_logfc <- function(sampletype="FTD"){
+    
+    t <- c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum")
+    #Calculate all unique pairs of tissues to correlate
+    tissue_comp <- permutations(3, 2, t, repeats.allowed=TRUE) 
+
+    plot_list <- list()
+    #For each tissue pair, compare the logfold changes in tissue x against tissue y.
+    #Genes in tissue x are associated with PMI; those in tissue y are associated with allFTD.
+    for(i in c(1:nrow(tissue_comp))){
+      
+      tx <- tissue_comp[i, 1]
+      ty <- tissue_comp[i, 2]
+      
+      xlab <- paste0("PMI", "\n", tx)
+      ylab <- paste0("FTD vs Control","\n", ty)
+      #Get the toptable for tissue x (PMI)
+      file_x <- diff_expr_pmi(tx, sampletype=sampletype)[[1]]
+      #Fetch the toptable for tissue y (allFTD vs Control)
+      if(ty=="Cerebellum"){
+        file_y=get(load(here::here("data/model_designs/Cerebellum_allFTD_vs_Control_model_2.RData")))[[1]]
+        } else
+          if(ty=="Frontal_Cortex"){
+            file_y=get(load(here::here("data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData")))[[1]]
+          } else
+            if(ty=="Temporal_Cortex"){
+              file_y=get(load(here::here("data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData")))[[1]]
+            }
+      
+     combined_table <- merge(file_x, file_y, by=0, all=TRUE) %>% drop_na()
+     
+     plot <-
+      ggplot(combined_table, aes(x=logFC.x,y=logFC.y))+
+        xlab(xlab) +
+        ylab(ylab) + 
+        geom_smooth(method=lm, se=FALSE)+
+        geom_hline(linetype="dashed", yintercept=0)+geom_vline(linetype="dashed", xintercept=0)+
+        geom_hex(bins=70, show.legend=FALSE)+
+       stat_cor(method="pearson", aes(label = paste("'R ='", ..r../10, sep = "~` `~")), label.x.npc=0.02, label.y.npc=0.97, size=5)+
+       scale_x_continuous(limits=symmetric_limits)+
+       scale_y_continuous(limits=symmetric_limits)+
+        scale_fill_continuous(type="viridis")+
+        theme_bw(base_size = 16)+
+       theme(
+            # panel.border = element_blank(),
+            axis.line=element_line(color="black"),
+            axis.text=element_text(color="black"),
+            panel.grid.minor = element_blank(),
+            panel.grid.major = element_blank())
+     
+     plot_list[[i]] <- plot
+     
+    }
+    
+    egg::ggarrange(plots=plot_list, ncol=3)
+
+}
+```
+
+## FTD Cases {.tabset .tabset-fade .tabset-pills}
+Correlate PMI genes in the FTD samples against FTD genes
+```{r logfc_correlations_cases, echo=FALSE, fig.height=10, fig.width=12}
+correlate_logfc(sampletype="FTD") 
+```
+
+
+## Controls {.tabset .tabset-fade .tabset-pills}
+Correlate PMI genes in the control samples against FTD genes
+```{r logfc_correlations_controls, echo=FALSE, fig.height=10, fig.width=12}
+correlate_logfc(sampletype="Control")
+```
+
+
+
+# Top Genes vs PMI 
+Get the top 6 genes associated with PMI. For each gene, correlate their voom-normalized expression in the samples with the PMI scores of the samples. Do this for both cases and controls, in each tissue.
+```{r pmi_correlations, echo=FALSE, cache=TRUE}
+
+correlate_pmi <- function(t, sampletype="FTD", subtitle=""){
+    #Run differential expression using PMI as a continuous variable. Then, get the top 6 genes associated with PMI.
+    pmi_top_table <- 
+      diff_expr_pmi(t, toptable=TRUE, voomtable=FALSE, sampletype=sampletype)[[1]] %>%
+      rownames_to_column("gene") %>%
+      arrange(adj.P.Val) %>%
+      select(gene, logFC, P.Value, adj.P.Val) %>%
+      .[c(1:6),]
+    #Print the top genes and their p-values.
+    pmi_top_table %>%  kable(caption = subtitle) %>% print()
+    
+    pmi_top_genes <- 
+      select(pmi_top_table, gene) %>%
+      unlist() %>%
+      .[c(1:6)]
+    #Get the voom-normalized counts from limma. 
+    pmi_gene_counts <-
+      diff_expr_pmi(t, coef=2, toptable=FALSE, voomtable=TRUE, sampletype=sampletype)[[1]] %>%
+      as.data.frame() %>%
+      rownames_to_column("gene") %>%
+      filter(gene %in% pmi_top_genes) %>% 
+      pivot_longer(cols=where(is.numeric), names_to="sample", values_to="expr")
+  
+    load(here::here(paste0("data/support/", t, ".RData")))
+    #Get the PMI scores from the metadata, and join them with the counts.
+    left_join(pmi_gene_counts, support_loc, by="sample") %>%
+      ggplot(aes(x=expr, y=pmi))+
+      ggtitle(paste0(t, " - ", subtitle))+
+      geom_point()+
+      geom_smooth(method="lm")+
+      xlab("Voom-normalized expression")+
+      ylab("PMI")+
+      stat_cor(method="pearson", label.x=1, label.y=-20)+
+      theme_bw()+
+      facet_wrap(~gene)
+    
+}
+
+```
+
+## Cerebellum {.tabset .tabset-fade .tabset-pills}
+
+### FTD Cases {.tabset .tabset-fade .tabset-pills}
+```{r pmi_correlations_cere_cases, echo=FALSE, fig.height=7, fig.width=10, cache=TRUE}
+correlate_pmi("Cerebellum", sampletype="FTD", subtitle="FTD Cases")
+```
+
+### Controls {.tabset .tabset-fade .tabset-pills}
+```{r pmi_correlations_cere_controls, echo=FALSE, fig.height=7, fig.width=10, cache=TRUE}
+correlate_pmi("Cerebellum", sampletype="Control", subtitle="Controls")
+```
+
+
+## Frontal Cortex {.tabset .tabset-fade .tabset-pills}
+
+### FTD Cases {.tabset .tabset-fade .tabset-pills}
+```{r pmi_correlations_fc_cases, echo=FALSE, fig.height=7, fig.width=10, cache=TRUE}
+correlate_pmi("Frontal_Cortex", sampletype="FTD", subtitle="FTD Cases")
+```
+
+### Controls {.tabset .tabset-fade .tabset-pills}
+```{r pmi_correlations_fc_controls, echo=FALSE, fig.height=7, fig.width=10, cache=TRUE}
+correlate_pmi("Frontal_Cortex", sampletype="Control", subtitle="Controls")
+```
+
+
+## Temporal Cortex {.tabset .tabset-fade .tabset-pills}
+
+### FTD Cases {.tabset .tabset-fade .tabset-pills}
+```{r pmi_correlations_tc_cases, echo=FALSE, fig.height=7, fig.width=10, cache=TRUE}
+correlate_pmi("Temporal_Cortex", sampletype="FTD", subtitle="FTD Cases")
+```
+
+### Controls {.tabset .tabset-fade .tabset-pills}
+```{r pmi_correlations_tc_controls, echo=FALSE, fig.height=7, fig.width=10, cache=TRUE}
+correlate_pmi("Temporal_Cortex", sampletype="Control", subtitle="Controls")
+```

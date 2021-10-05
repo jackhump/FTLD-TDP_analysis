@@ -1,0 +1,258 @@
+---
+title: "Deconvolution pipeline"
+author: "Rahat Hasan"
+date: "February 11, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+
+```{=html}
+<style>
+    body .main-container {
+        max-width: 1600px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE)
+knitr::opts_chunk$set(error = TRUE)
+remotes::install_github("oganm/markerGeneProfile")
+library(dtangle)
+library(DSA)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(grid)
+library(MASS)
+library(markerGeneProfile)
+library(declassification)
+library(glmnet)
+library(amritr)
+library(RColorBrewer)
+library(reshape2)
+library(ggsci)
+library(ggpubr)
+library(egg)
+
+```
+
+```{r expression, include=FALSE}
+load("../data/gene_matrix.RData")
+rm(genes_tpm)
+
+rna_metadata <- read_tsv("../data/rna_support.tsv") %>%
+  dplyr::mutate(age = replace_na(age, median(age, na.rm = TRUE)),
+        pmi = replace_na(pmi, median(pmi, na.rm = TRUE)) ) %>%
+  dplyr::filter(QC_PASS== TRUE,
+         rin > 5,
+         tissue == 'Cerebellum' | tissue == 'Frontal_Cortex' | tissue == 'Temporal_Cortex',
+         disease == 'FTD' | disease == 'Control',
+         site == 'University College London', 
+         is.na(pathology) | pathology != "FTD-FUS" & pathology != "FTD-TAU",
+         sample != "CGND-HRA-00902") ##Removes FTD-FUS and TAU samples (18)
+
+ 
+genes_loc <- as.data.frame(genes_counts[, rna_metadata$sample])
+#rm(genes_counts)
+
+# remove lowly expressed genes
+keep.exp <- rowSums(cpm(genes_loc) > 1) >= ceiling(0.9*ncol(genes_loc))
+genes_loc <- genes_loc[keep.exp,]
+
+
+geneExpr_our <- as.data.frame(genes_loc)
+geneExpr_our[, "ensembl"] <- rownames(geneExpr_our) %>% gsub("\\..*","",.)
+genename <- clusterProfiler::bitr(geneExpr_our$ensembl, fromType="ENSEMBL", toType=c("SYMBOL"), OrgDb="org.Hs.eg.db")
+geneExpr_our <- merge(geneExpr_our, genename, by.x = "ensembl", by.y = "ENSEMBL")
+
+
+geneExpr_our <- geneExpr_our[! duplicated(geneExpr_our$SYMBOL),]
+
+rownames(geneExpr_our) = geneExpr_our$SYMBOL
+geneExpr_our$ensembl = NULL
+geneExpr_our$SYMBOL= NULL
+
+rm(genes_loc)
+
+tissues <- c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum")
+
+```
+
+```{r MathysCells, eval=FALSE, warning=FALSE, include=FALSE, messsage=FALSE}
+load("data/Mathys/Mathys_counts.RData")
+
+Mathys_metadata_file <- "data/Mathys/SraRunTable.txt"
+
+Mathys_metadata <- 
+  readr::read_csv(Mathys_metadata_file) %>% 
+  janitor::clean_names() %>%
+  dplyr::select(cellID = sample_name, cellType = cell_type, sampleID = experiment_sample_name )
+
+Mathys_metadata <- filter(Mathys_metadata, cellID %in% colnames(Mathys))
+
+MathysCells <- Mathys_metadata$cellType
+names(MathysCells) <- Mathys_metadata$cellID
+
+ 
+# intersect our data with Mathys, calculate marker genes
+int <- intersect(rownames(geneExpr_our),rownames(Mathys))
+
+int <- rownames(Mathys)
+
+y <- DGEList(counts= Mathys[int,])
+y <- calcNormFactors(y,method = 'TMM', Acutoff =  quantile(log2(Mathys[,1]/sum(Mathys[,1])),0.75))
+Mathys <- cpm(y, log=FALSE)
+MathysMean = sapply(unique(MathysCells),function(x)rowMeans(Mathys[,names(which(MathysCells==x))]))
+int <- intersect(rownames(geneExpr_our),rownames(MathysMean))
+
+int <- rownames(MathysMean)
+
+design <- model.matrix(~.-1,data.frame(cell= MathysCells[colnames(Mathys)]))
+colnames(design) <- gsub('cell','',colnames(design))
+v <- voom(Mathys[int,rownames(design)], design, plot=FALSE)
+fit <- lmFit(v, design)
+x <- sapply(colnames(design),function(x)paste(x,'-(',paste(colnames(design)[colnames(design)!=x],collapse = "+"),')/4',sep = ''))
+con = makeContrasts(contrasts = x,levels = colnames(design))
+fit = contrasts.fit(fit,con)
+fit <- eBayes(fit, robust=TRUE)
+
+
+MathysMarkers = NULL
+
+n_markers <- 20
+
+for(i in 1:ncol(design)){
+  x = fit$coef[p.adjust(fit$p.v[,i],'fdr')<0.05,i]
+  MathysMarkers[[colnames(design)[i]]] =  names(head(sort(-x[x>0]),n_markers))
+}
+unlist(lapply(MathysMarkers,length))
+MathysMarkersFull = NULL
+for(i in 1:ncol(design)){
+  x = fit$coef[p.adjust(fit$p.v[,i],'fdr')<0.05,i]
+  MathysMarkersFull[[colnames(design)[i]]] =  names(sort(-x[x>0]))
+}
+unlist(lapply(MathysMarkersFull,length))
+
+# get microglial comparison 1 - vs mean of all
+microglia_vs_all <- topTable(fit, coef = 3, number = Inf)  %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene_name") %>%
+  janitor::clean_names()
+
+microglia_vs_all %>%
+  filter(adj_p_val < 0.05, log_fc > 2) %>%
+  arrange( desc(log_fc))
+
+# better comparison - microglia vs neurons
+mg_neur <- filter(Mathys_metadata, cellType %in% c("neurons", "microglia")) %>%
+  mutate(cellType = factor(cellType, levels = c("neurons", "microglia")))
+row.names(mg_neur) <- mg_neur$cellID
+
+design2 <- model.matrix(~ cellType,  mg_neur) #data.frame(cell= MathysCells[mg_neur$cellID]))
+
+v <- voom(Mathys[int,rownames(design2)], design2, plot=FALSE)
+fit <- lmFit(v, design2)
+
+#fit = contrasts.fit(fit,con)
+
+fit <- eBayes(fit, robust=TRUE)
+
+```
+
+```{r createMarkers, eval=FALSE, warning=FALSE, include=FALSE, messsage=FALSE}
+# take reference dataset (Mathys) and create markers
+# differential expression - compare each cell type to the mean
+compareReferenceCells <- function(bulk_expression, reference_expression, reference_meta){
+  # only use reference genes present in bulk
+  int <- intersect(rownames(bulk_expression),rownames(reference_expression))
+  y <- DGEList(counts= reference_expression[int,])
+  y <- calcNormFactors(y,method = 'TMM', Acutoff =  quantile(log2(reference_expression[,1]/sum(reference_expression[,1])),0.75))
+  
+  reference_expression <- cpm(y, log=FALSE)
+  reference_expressionMean = sapply(unique(reference_meta),function(x)rowMeans(reference_expression[,names(which(reference_meta==x))]))
+  int = intersect(rownames(bulk_expression),rownames(reference_expressionMean))
+  design = model.matrix(~.-1,data.frame(cell= reference_meta[colnames(reference_expression)]))
+  colnames(design) = gsub('cell','',colnames(design))
+  v <- voom(reference_expression[int,rownames(design)], design, plot=FALSE)
+  fit <- lmFit(v, design)
+  x = sapply(colnames(design),function(x)paste(x,'-(',paste(colnames(design)[colnames(design)!=x],collapse = "+"),')/4',sep = ''))
+  con = makeContrasts(contrasts = x,levels = colnames(design))
+  fit = contrasts.fit(fit,con)
+  fit <- eBayes(fit, robust=TRUE)
+  
+  return(list(design = design, fit = fit))
+}
+
+createMarkers <- function( input, n_markers = 10){
+  markers = NULL
+  
+  for(i in 1:ncol(input$design)){
+    x = input$fit$coef[p.adjust(input$fit$p.v[,i],'fdr')<0.05,i]
+    markers[[colnames(input$design)[i]]] =  names(head(sort(-x[x>0]),n_markers))
+  }
+  unlist(lapply(markers,length))
+  
+  full_genes = NULL
+  for(i in 1:ncol(input$design)){
+    x = input$fit$coef[p.adjust(input$fit$p.v[,i],'fdr')<0.05,i]
+   full_genes[[colnames(input$design)[i]]] =  names(sort(-x[x>0]))
+  }
+  unlist(lapply(full_genes,length))
+  
+  return( list(markers = markers, full = full_genes) )
+}
+
+Mathys_fit <- compareReferenceCells(bulk_expression = geneExpr_our, reference_expression = Mathys, reference_meta = MathysCells)
+
+Mathys_markers <- createMarkers(Mathys_fit, n_markers = 100)
+
+```
+
+```{r deconv.Mathys, eval=FALSE, warning=FALSE, include=FALSE, messsage=FALSE}
+
+summariseSingleCell <- function(expression_matrix, cell_meta){
+  sapply(unique(MathysCells),function(x)rowMeans(Mathys[,names(which(MathysCells==x))]))
+}
+
+d_mean <- split(Mathys_metadata, Mathys_metadata$cellType) %>%
+  map("cellID") %>%
+  map_dfc( ~{
+    rowMeans(cpm(Mathys[,.x]))
+  }) %>% as.data.frame()
+row.names(d_mean) <- row.names(Mathys)
+
+sce = d_mean #MathysMean #d_mean 
+ge = geneExpr_our
+commongenes <- intersect (rownames(ge), rownames(sce))
+ge <- ge[pmatch(commongenes, rownames(ge)), ]
+sce <- sce[pmatch(commongenes, rownames(sce)), ]
+y <- cbind(sce, ge)
+y <- DGEList(counts= y)
+y <- calcNormFactors(y,method = 'TMM', Acutoff =  quantile(log2(Mathys[,1]/sum(Mathys[,1])),0.75))
+y <- cpm(y, log=FALSE)
+y = normalizeQuantiles(y)
+pure_samples = as.list(1:5)
+names(pure_samples) = colnames(y)[1:5]
+markers = lapply(Mathys_markers$markers,intersect,rownames(y))
+dtMathys <- dtangle(log2(t(y)), pure_samples=pure_samples, markers = markers[names(pure_samples)])$estimates
+
+```
+
+

@@ -1,0 +1,119 @@
+---
+title: "DNA methylation correlations"
+subtitle: "Correlating deconvolution estimates with DNA methylation estimatess"
+author: "Rahat Hasan"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, include=FALSE, results='hide'}
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(readxl)
+
+```
+
+
+```{r echo=TRUE, fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+
+qsbb_table <- 
+  read_tsv("../data/UCL_samples.tsv") %>%
+  dplyr::select(c("external_subject_id", "qsbb_id")) %>%
+  distinct()
+
+ additional_qsbbs <-
+  read_csv("../data/additional_qsbbs.csv")
+ 
+ qsbb_table <-
+   rbind(qsbb_table, additional_qsbbs)
+
+dna_m <- 
+  read_csv("../data/DNAm_neuronal_proportions_Jack.csv") %>%
+  dplyr::mutate(Sample_Name = ifelse(grepl("TDP", Sample_Name, fixed = TRUE), "FTD-TDP", "Control")) %>%
+  dplyr::rename(disease=Sample_Name, qsbb_id=Sample_ID, DNA_methylation=NeuronProp)
+
+deconv_data <- 
+  load("../FTD_deconvolution/data/mathys_dtangle_res.RData") %>%
+  get() %>%
+  dplyr::filter(tissue == "Frontal_Cortex") %>%
+  dplyr::mutate(disease = ifelse(disease=="FTD", "FTD-TDP", "Control")) %>%
+  dplyr::select("individual", "sample", "cell", "tissue", "disease", "deconv") %>%
+  dplyr::rename("external_subject_id"="individual")
+
+combined_data <-
+  left_join(deconv_data, qsbb_table, by="external_subject_id") %>%
+  left_join(dna_m) %>%
+  drop_na()
+
+filter(combined_data, cell=="Ex") %>%
+  ggplot(aes(y=DNA_methylation, x=deconv))+
+    geom_point(color="gray60", size=2)+
+    geom_smooth(method="lm",  linetype="solid", se=FALSE, color="black")+
+    stat_cor(color="black", method="spearman")+
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1))+
+    ggtitle("Deconvolution vs DNA methylation")+
+    ylab("DNA methylation")+
+    xlab("Excitatory neuron proportion")+
+    theme_bw()+ 
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      text = element_text(color="black"),
+      axis.line = element_line(colour = "black"),
+      axis.text = element_text(color="black"),
+      strip.background = element_blank())
+
+filter(combined_data, cell=="In") %>%
+  ggplot(aes(y=DNA_methylation, x=deconv))+
+    geom_point(color="gray60", size=2)+
+    geom_smooth(method="lm",  linetype="solid", se=FALSE, color="black")+
+    stat_cor(color="black", method="spearman")+
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1))+
+    ggtitle("Deconvolution vs DNA methylation")+
+    ylab("DNA methylation")+
+    xlab("Inhibitory neuron proportion")+
+    theme_bw()+ 
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      text = element_text(color="black"),
+      axis.line = element_line(colour = "black"),
+      axis.text = element_text(color="black"),
+      strip.background = element_blank())
+
+
+
+
+```
+
+
+
+
+
+

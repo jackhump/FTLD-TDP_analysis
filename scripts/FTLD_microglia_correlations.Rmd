@@ -1,0 +1,169 @@
+---
+title: "Microglia Correlations"
+subtitle: "Correlating deconvolution estimates with microglial proliferation scores"
+author: "Rahat Hasan"
+date: "May 12, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, include=FALSE, results='hide'}
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(readxl)
+library(egg)
+library(patchwork)
+
+```
+
+# CD68, CR343, and IBA1
+Correlate the microglial proliferation scores with the deconvolution estimates from Mathys - FTD samples only 
+
+```{r microglia_corr_cd68_dtangle, echo=TRUE, fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+
+count <- function(raw_data){
+  #Arrange the raw microglia data, to get a count column 
+   microglia_counts <- 
+    raw_data %>%
+    dplyr::rename(qsbb_id=Case, disease=Pathoverall) %>%
+    dplyr::mutate(qsbb_id=gsub(pattern="-", replacement="/", x=qsbb_id),
+           disease=ifelse(disease=="FTLD", "FTD", disease)) %>%
+    dplyr::filter(disease %in% c("FTD", "Control")) %>%
+    dplyr::select("qsbb_id", "disease", contains("nummicroglia")) %>%
+    dplyr::select("qsbb_id", "disease", contains("FG"), contains("TG")) %>%
+    pivot_longer(cols=contains("nummicroglia"), names_to="tissue", values_to="microglia_count") %>%
+    dplyr::mutate(tissue = ifelse(grepl("FG", tissue), "Frontal_Cortex", "Temporal_Cortex" ))
+ 
+  return(microglia_counts)
+  
+}
+
+correlate_microglia <- function(deconv_data, microglia_data, title){
+  
+  #Get the QSBB IDs of all the samples
+  qsbb_table <- 
+      read_tsv("../data/UCL_samples.tsv") %>%
+      dplyr::select(c("external_subject_id", "qsbb_id")) %>%
+      distinct() %>%
+      drop_na()
+  
+  additional_qsbbs <-
+    read_csv("../data/additional_qsbbs.csv")
+  
+  qsbb_table <-
+    rbind(qsbb_table, additional_qsbbs)
+  
+  #Get the deconvolution estimates 
+  deconv_data <- 
+    deconv_data %>%
+    dplyr::filter(cell == "microglia", tissue %in% c("Frontal_Cortex", "Temporal_Cortex")) %>%
+    dplyr::select("individual", "sample", "cell", "tissue", "disease", "deconv") %>%
+    dplyr::rename(external_subject_id=individual)  
+
+  #Join the deconvolution and microglial data by QSBB ID and tissue
+  combined_data <-
+    left_join(deconv_data, qsbb_table, by="external_subject_id") %>%
+    left_join(microglia_data, by=c("qsbb_id", "tissue", "disease")) %>%
+    drop_na()
+ 
+  #Correlate the estimates of microglial composition with their counts
+
+  microglia_plot <-
+    combined_data %>%
+    filter(disease=="FTD") %>%
+    ggplot(aes(x=microglia_count, y=deconv))+
+    geom_point(color="gray60", size=1)+
+    geom_smooth(method="lm",  linetype="solid", se=FALSE, color="black", size=0.5)+
+    stat_cor(color="black", method="spearman", size=3)+
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+    xlab("Microglia count")+
+    ylab("Estimated proportions from Mathys")+
+    ggtitle(title)+
+    facet_wrap(~tissue, scales="free_x", ncol=1)+
+    theme_bw()+ 
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      strip.text=element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      text = element_text(color="black"),
+      axis.line = element_line(colour = "black"),
+      axis.text = element_text(color="black"),
+      strip.background = element_blank(),
+      panel.spacing = unit(0.5, "lines"))
+
+  return(microglia_plot)
+
+
+}
+
+mathys_dtangle_res <- load("../FTD_deconvolution/data/mathys_dtangle_res.RData") %>% get() %>% mutate(cell=ifelse(cell=="Mic", "microglia", cell))
+
+cd68_microglia <- read_excel("../data/CD68allcases.xlsx")
+cr343_microglia <- read_excel("../data/CR343allcases.xlsx")
+iba1_microglia <- read_excel("../data/Iba1allcases.xlsx")
+
+
+mathys_dtangle_cd68 <- correlate_microglia(mathys_dtangle_res, count(cd68_microglia), "CD68")
+mathys_dtangle_cr343 <- correlate_microglia(mathys_dtangle_res, count(cr343_microglia), "CR343") 
+mathys_dtangle_iba1 <- correlate_microglia(mathys_dtangle_res, count(iba1_microglia), "Iba1")
+
+#Top row is frontal cortex, bottom row is temporal cortex
+mathys_dtangle_cd68 + mathys_dtangle_cr343 + mathys_dtangle_iba1 + plot_layout(nrow=1, ncol=3)
+
+```
+
+
+
+# Total Counts 
+Correlate the total counts of all three markers with the deconvolution estimates from Mathys
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+sample_balance <- read_csv("../data/sample_balance.csv") %>% dplyr::select(-c("individual", "sample"))
+
+cd68_counts <- 
+  count(cd68_microglia) %>%
+  dplyr::rename(cd68_count=microglia_count)
+
+cr343_counts <- 
+  count(cr343_microglia) %>%
+  dplyr::rename(cr343_count=microglia_count)
+
+iba1_counts <- 
+  count(iba1_microglia) %>%
+  dplyr::rename(iba1_count=microglia_count)
+
+#Sum up counts for all three markers
+total_counts <- 
+  left_join(cd68_counts, cr343_counts, by=c("qsbb_id", "tissue", "disease")) %>%
+  left_join(iba1_counts, by=c("qsbb_id", "tissue", "disease")) %>%
+  left_join(sample_balance, by=c("qsbb_id", "tissue")) %>%
+  mutate(microglia_count = cd68_count+cr343_count+iba1_count)
+
+
+correlate_microglia(mathys_dtangle_res, total_counts, "Total")
+```
+
+
+

@@ -1,0 +1,347 @@
+
+---
+title: "Principal Component Analysis"
+author: "Rahat Hasan"
+date: "December 16, 2020"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1500px;
+    }
+</style>
+
+```{r load.packages, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+library("knitr")
+library("edgeR")
+library("doParallel")
+library("gt")
+library("limma")
+library("pheatmap")
+library("patchwork")
+library("variancePartition")
+library("stats")
+library("ggfortify")
+library("gplots")
+library("ggpubr")
+library("broom")
+library("ggeasy")
+library("factoextra")
+library("RColorBrewer")
+library("tidyverse")
+library("robustbase")
+library("DiagrammeR")
+
+cl <- makeCluster(4)
+registerDoParallel(cl)
+
+knitr::opts_chunk$set( 
+  warning=FALSE,
+  message=FALSE,
+  results = 'asis',
+  error = FALSE,
+  tidy = FALSE,
+  fig.show = "hold")
+```
+
+# RNA-seq data processing
+
+Get all FTLD-TDP and control samples from QSBB with RIN > 5, and remove one outlier (CGND-HRA-00902)
+```{r metadata, echo=TRUE, message=FALSE, warning=FALSE}
+rna_tech <- read_tsv("../data/rna_technical_metrics.tsv") %>%
+  dplyr::rename(sample = external_sample_id) %>%
+  dplyr::select(sample, starts_with('pct'), starts_with('median'), mean_read_length, strand_balance, estimated_library_size)
+
+rna_metadata <- read_tsv("../data/rna_support.tsv") %>%
+  mutate(age = replace_na(age, median(age, na.rm = TRUE)),
+        pmi = replace_na(pmi, median(pmi, na.rm = TRUE)) ) %>%
+  filter(QC_PASS== TRUE,
+         rin > 5,
+         tissue == 'Cerebellum' | tissue == 'Frontal_Cortex' | tissue == 'Temporal_Cortex',
+         disease == 'FTD' | disease == 'Control',
+         site == 'University College London',
+         is.na(pathology) | pathology != "FTD-FUS" & pathology != "FTD-TAU", ## Get only FTD-TDP samples
+         sample != "CGND-HRA-00902") ##Removes an outlier 
+
+```
+
+
+```{r genexpression, message=FALSE, warning=FALSE, include=FALSE}
+load("../data/gene_matrix.RData")
+
+fix_tags <- function(data){
+  data$genes_no_tags <- str_split_fixed(row.names(data), "\\.", 2)[,1]
+  data <- data[ !duplicated(data$genes_no_tags),]
+  row.names(data) <- data$genes_no_tags
+  data$genes_no_tags <- NULL
+  return(data)
+}
+
+genes_counts <- fix_tags(genes_counts)
+genes_tpm <- fix_tags(genes_tpm)
+```
+
+
+```{r save_metadata, message=FALSE, warning=FALSE, include=FALSE}
+tissues <- unique(rna_metadata$tissue)
+
+support <- filter(rna_metadata, tissue %in% tissues)
+
+for(t in tissues){
+  support_loc <- filter(support, tissue == t ) %>% distinct() # any sneaky duplicate rows?
+  counts_loc <- genes_counts[, support_loc$sample] 
+  tpm_loc <- genes_counts[, support_loc$sample]
+  tech_loc <- filter(rna_tech, sample %in% support_loc$sample)
+  outFile <- here::here(paste0("data/", t, ".RData"))
+   # if( !file.exists(outFile)){
+    # save(support_loc, counts_loc, tpm_loc, tech_loc, file = outFile  )
+  #}
+}
+
+```
+
+```{r combine_metrics, include=FALSE}
+combine_metrics <- function(t, cat=TRUE){  ##Combines clinical and technical metrics into one dataframe. 'cat'=TRUE/FALSE includes or excludes categoricals
+  inFile <- paste0("data/support/", t, ".RData")
+  stopifnot(file.exists(inFile))
+  load(inFile)
+  
+  row.names(support_loc) <- support_loc$sample
+  row.names(tech_loc) <- tech_loc$sample
+  
+  libsize <- enframe(colSums(counts_loc)) %>% dplyr::rename(sample = name, total_counts = value) 
+  
+  support_loc <- dplyr::left_join(support_loc, libsize, by = 'sample')
+  
+  if(cat==FALSE){
+    support_loc <- select(support_loc, sample, disease, where(is.numeric))
+  }
+  
+  tech_loc <- select(tech_loc, sample, where(is.numeric))
+  
+  metric_df <- left_join(support_loc, tech_loc, by = c("sample"="sample"))
+  metric_df <- metric_df[, colSums(is.na(metric_df)) != nrow(metric_df)] ##Remove columns that are all NA
+  metric_df <- metric_df[, apply(metric_df, 2, function(x) replace_na(sd(x)>0, TRUE))] ##Remove columns with a SD of 0
+  
+  return(metric_df)
+}
+```
+
+# Principal Component Analysis {.tabset .tabset-fade .tabset-pills}
+```{r pca, echo=TRUE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE}
+diagnosticPlots <- function(t, pca_plots=TRUE, heatmaps=TRUE, vp_plots=TRUE, varpart_formula){
+  inFile <- paste0("data/support/", t, ".RData")
+  #stopifnot(file.exists(inFile))
+  load(inFile)
+  
+  site_table <- support_loc %>% dplyr::group_by(disease, site) %>% dplyr::tally() %>% tidyr::spread(key = disease, value = n) %>% knitr::kable(caption = " Disease group by submitting site", valign ='t')
+  
+  isexpr <- rowSums(cpm(counts_loc)>1) >= 0.9 * ncol(counts_loc)
+  gExpr <- DGEList(counts=counts_loc[isexpr,])
+  gExpr <- calcNormFactors(gExpr)
+  
+  vobjGenes <- voom(gExpr)
+  voom_pca <- prcomp(t(vobjGenes$E), center = TRUE, scale.=TRUE)
+
+  pca_df <- voom_pca$x %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "sample") %>%
+    select(sample, PC1, PC2) %>%
+    left_join(support_loc, by = "sample") %>%
+    left_join(tech_loc, by = "sample")
+
+  plot_pca_df <- function(colourby){
+    pca_df %>%
+      ggplot(aes(x = PC1, y = PC2)) +
+      geom_point(aes_string(colour = colourby), size=3)
+  }
+  
+  pca_plot <-
+    plot_pca_df("disease") +
+    plot_annotation(title = t) & theme_bw()
+  
+  if(pca_plots==TRUE){
+    print(site_table)
+    print(pca_plot)
+  }
+  
+  all_metadata <- combine_metrics(t, cat=TRUE) %>% select(-disease_full, -individual, -region, -tissue, -tissue_clean, -QC_PASS, -site, -platform, -prep, -motor_onset, -mutations, -pathology) ##These variables aren't interesting to us
+
+  covariates <- colnames(all_metadata)[-1]
+  
+  ind <- get_pca_ind(voom_pca) # PCs for individuals
+  indx <- sapply(all_metadata, is.character)
+  all_metadata[indx] <- lapply(all_metadata[indx], function(x) as.factor(x))
+
+  matrix_rsquared = matrix(NA, nrow = length(covariates), ncol = 15) #Number of factors
+  matrix_pvalue = matrix(NA, nrow = length(covariates), ncol = 15)
+  
+  for (x in 1:length(covariates)){
+    for (y in 1:15){
+      matrix_rsquared[x,y] <- summary( lm(ind$coord[,y] ~ as.matrix(all_metadata[,covariates[x]])) )$adj.r.squared
+      matrix_pvalue[x,y] <- glance(lm(ind$coord[y,] ~ as.matrix(all_metadata[,covariates[x]])) )$p.value #To insert pvalues in the heatmap
+    }
+  }
+  
+  rownames(matrix_rsquared) = covariates
+  rownames(matrix_pvalue) = covariates 
+  
+  matrix_pvalue = matrix(p.adjust(as.vector(as.matrix(matrix_pvalue)), method='bonferroni'),ncol=ncol(matrix_pvalue))
+  matrix_pvalue = formatC(matrix_pvalue, format = "e", digits = 2)
+  
+  all_metadata <- all_metadata[, -1]
+  indx <- sapply(all_metadata, is.factor)
+  all_metadata[indx] <- lapply(all_metadata[indx], function(x) as.numeric(x))
+  
+  if(heatmaps == TRUE){
+  pheatmap( all_metadata %>% cor(method = "spearman") %>% abs(), main = "Spearman correlation between technical covariates", display_numbers = TRUE)
+  pheatmap(matrix_rsquared, main="Variance of expression PC explained by covariate (R^2)", labels_col = paste0("PC", c(1:15)), display_numbers=TRUE)
+
+  }
+
+  if(vp_plots==TRUE){
+
+    varPart <- fitExtractVarPartModel( vobjGenes, form, all_metadata  )
+    vp <- sortCols(varPart)
+    plotVarPart(vp) + labs(title = t)
+  }
+}
+```
+
+## Cerebellum {.tabset .tabset-fade .tabset-pills}
+```{r pca_plots_cere, echo=FALSE, fig.height=6, fig.width=10, warning=FALSE, res=300}
+diagnosticPlots("Cerebellum", pca_plots=TRUE, heatmaps=FALSE, vp_plots=FALSE)
+
+```
+
+## Frontal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r pca_plots_fc, echo=FALSE, fig.height=6, fig.width=10, warning=FALSE, res=300}
+diagnosticPlots("Frontal_Cortex", pca_plots=TRUE, heatmaps=FALSE, vp_plots=FALSE)
+```
+
+## Temporal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r pca_plots_tc, echo=FALSE, fig.height=6, fig.width=10, warning=FALSE, res=300}
+diagnosticPlots("Temporal_Cortex", pca_plots=TRUE, heatmaps=FALSE, vp_plots=FALSE)
+```
+
+# Covariate matrices {.tabset .tabset-fade .tabset-pills}
+
+## Cerebellum {.tabset .tabset-fade .tabset-pills}
+```{r heatmaps_cere, echo=FALSE, fig.height=9, fig.width=12, warning=FALSE, res=300}
+diagnosticPlots("Cerebellum", pca_plots=FALSE, heatmaps=TRUE, vp_plots=FALSE)
+```
+
+## Frontal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r heatmaps_fc, echo=FALSE, fig.height=9, fig.width=12, warning=FALSE, res=300}
+diagnosticPlots("Frontal_Cortex", pca_plots=FALSE, heatmaps=TRUE, vp_plots=FALSE)
+```
+
+## Temporal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r heatmaps_tc, echo=FALSE, fig.height=9, fig.width=12, warning=FALSE, res=300}
+diagnosticPlots("Temporal_Cortex", pca_plots=FALSE, heatmaps=TRUE, vp_plots=FALSE)
+```
+
+
+```{r outliers, eval=FALSE, fig.height=9, fig.width=11, include=FALSE}
+#In PCA plot for Cerebellum, CGND-HRA-00902 is an outlier 
+cere_metrics <- combine_metrics("Cerebellum", FALSE) %>% pivot_longer(where(is.numeric), names_to="metric", values_to="metric_val")
+
+cere_metrics %>%  ggplot(aes(x=disease, y=metric_val, color=disease)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(data=subset(cere_metrics, sample == "CGND-HRA-00902"), aes(disease, metric_val)) + 
+  theme(plot.title = element_text(hjust=0.5),
+        plot.subtitle = element_text(hjust=0.5),
+      legend.title = element_blank(),
+      legend.position="top",
+      axis.text.x=element_text(vjust = 1))+
+  xlab("Disease")+
+  ylab("Metric Value")+
+  ggtitle(label = "Outlier Placement in the Metrics: Cerebellum",
+          subtitle = "CGND-HRA-00902") +
+  facet_wrap(~metric, scales = "free_y")
+
+```
+
+# Variance Partioning 
+Apply variance partioning on each tissue using the best model
+```{r vp_plots, echo=TRUE, fig.height=4, fig.width=10, warning=FALSE, cache=TRUE, res=300}
+form_fc <- ~ (1|disease) + (1|sex) + (1|age) + (1|sex) + median_3prime_prime_bias # model 2
+form_tc <- ~ (1|disease) + (1|sex) + (1|age) + (1|sex) + pct_r2_transcript_strand_reads + pct_intronic_bases + pct_ribosomal_bases # model 7
+form_cb <- ~ (1|disease) + (1|sex) + (1|age) + (1|sex) + pct_r2_transcript_strand_reads # model 4
+
+
+diagnosticPlots("Frontal_Cortex", pca_plot=FALSE, heatmaps=FALSE, vp_plot=TRUE, varpart_formula=form_fc)+
+  diagnosticPlots("Temporal_Cortex", pca_plot=FALSE, heatmaps=FALSE, vp_plot=TRUE, varpart_formula=form_tc)+
+  diagnosticPlots("Cerebellum", pca_plot=FALSE, heatmaps=FALSE, vp_plot=TRUE, varpart_formula=form_cb)
+  
+```
+
+# Comparison of Metrics by Disease Status {.tabset .tabset-fade .tabset-pills}
+Comparisons were made using the Wilcoxon rank sum test.
+```{r metric_plot, collapse = TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+plot_metrics <- function(t, metrics){
+  metrics %>%
+    filter_all(all_vars(is.na(.)==FALSE)) %>%
+    select(-"estimated_library_size", -"total_counts") %>%
+    pivot_longer(cols = where(is.numeric), names_to = "metric_name", values_to = "metric_value") %>%
+    ggplot( aes(x=disease, y=metric_value, color=disease))+
+      geom_boxplot(ylim = c(0,100))+
+      stat_compare_means(label = "p.signif", label.x.npc = 0.5, label.y.npc=0.85, size=3)+
+      xlab("Disease")+
+      ylab("Metric Value")+
+      ggtitle(paste("Distribution of Metrics in:", t)) +
+      facet_wrap(~metric_name, scales = "free_y")+
+      theme_bw()+
+      theme(plot.title = element_text(hjust=0.5),
+        legend.title = element_blank(),
+        legend.position="top",
+        axis.text.x=element_text(vjust = 1))
+}
+
+p_table <- function(metrics){
+  disease <- metrics$disease %>% unique() %>% as.vector()
+  metric_names <- metrics %>% select(where(is.numeric)) %>% colnames() %>% as.vector()
+  formula <- paste0(metric_names,collapse=", ") %>% paste0("c(", . , ")", "~disease") %>% as.formula() 
+  p_table <- compare_means(formula, data=metrics)
+  
+  for(i in disease){
+    medians <- metrics %>% filter(disease == i) %>% select(where(is.numeric)) %>% as.matrix() %>% colMedians() %>% as.vector() %>% signif(digits=3)
+    p_table <- cbind.data.frame(p_table, medians)
+  }
+  p_table <- p_table[,c(1,9,10,4,6,7)]
+  colnames(p_table) <- c("Metric", "Control Median", "FTD Median", "p", "P_value", "Sig_Code")
+  p_table %>% arrange(p) %>% select(-"p")
+}
+
+```
+
+## Cerebellum {.tabset .tabset-fade .tabset-pills}
+```{r metric_plot_cere, echo=TRUE, fig.height=9, fig.width=11, warning=FALSE, res=300}
+cere_metrics <- combine_metrics("Cerebellum", cat=FALSE)
+plot_metrics("Cerebellum", cere_metrics)
+p_table(cere_metrics)
+```
+
+## Frontal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r metric_plot_fc, echo=TRUE, fig.height=9, fig.width=11, warning=FALSE, res=300}
+fc_metrics <- combine_metrics("Frontal_Cortex", cat=FALSE)
+plot_metrics("Cerebellum", fc_metrics)
+p_table(fc_metrics)
+```
+
+## Temporal Cortex {.tabset .tabset-fade .tabset-pills}
+```{r metric_plot_tc, echo=TRUE, fig.height=9, fig.width=11, warning=FALSE, res=300}
+tc_metrics <- combine_metrics("Temporal_Cortex", cat=FALSE)
+plot_metrics("Temporal_Cortex", tc_metrics)
+p_table(tc_metrics)
+```

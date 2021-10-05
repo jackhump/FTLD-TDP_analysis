@@ -1,0 +1,127 @@
+---
+title: "Expression weighted cell-type enrichment analysis (EWCE)"
+subtitle: "Mathys et al 2019"
+author: "Rahat Hasan"
+date: "June 30, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(janitor)
+```
+
+```{r eval=FALSE, include=FALSE}
+library(EWCE)
+library(Matrix)
+
+#Load the Mathys et al raw count matrix
+mathys_counts <- 
+  readMM("processed_matrix/filtered_count_matrix.mtx.gz") %>%
+  as.matrix()
+
+#Load the single-cell metadata
+mathys_meta <- 
+  read_tsv("processed_matrix/filtered_column_metadata.txt") %>%
+  janitor::clean_names()
+
+rownames(mathys_counts) <- readLines("processed_matrix/filtered_gene_row_names.txt")
+colnames(mathys_counts) <- mathys_meta$tag
+
+#Drop lowly expressed genes
+mathys_counts_dropped <- drop.uninformative.genes(exp=mathys_counts, level2annot=mathys_meta$subcluster)
+
+annotation_levels = list(level1class=mathys_meta$broad_cell_type, level2class=mathys_meta$subcluster)
+
+# Generate cell-type data object from counts
+generate.celltype.data(exp=mathys_counts_dropped, annotLevels=annotation_levels, groupName = "Mathys", savePath=getwd())
+
+mathys_ctd <- load("data/CellTypeData_Mathys.rda") %>% get()
+
+load("FTD_de_res.RData")
+source("/hpc/users/hasanr02/EWCE-pipeline/scripts/EWCE_main_script_first_half_only.R")
+
+ewce_results_lv1 <- analyze_using_EWCE(tissue_data = de_res_final, 
+                                       sort_by_col = 4, 
+                                       hgnc_names_col = 8, 
+                                       cell_type_data = mathys_ctd, 
+                                       annotation_levels = 1, 
+                                       tissue_data_species = "human", 
+                                       cell_type_data_species = "human", 
+                                       gene_threshold = 250, 
+                                       bootstrap_reps = 10000, 
+                                       output_name = "data/FTD_Mathys_lv1_res.RData")
+
+ewce_results_lv2 <- analyze_using_EWCE(tissue_data = de_res_final, 
+                                       sort_by_col = 4, 
+                                       hgnc_names_col = 8, 
+                                       cell_type_data = mathys_ctd, 
+                                       annotation_levels = 2, 
+                                       tissue_data_species = "human", 
+                                       cell_type_data_species = "human", 
+                                       gene_threshold = 250, 
+                                       bootstrap_reps = 10000, 
+                                       output_name = "data/FTD_Mathys_lv2_res.RData")
+
+```
+
+# EWCE
+```{r echo=TRUE, message=FALSE, warning=FALSE, dpi=300}
+
+load("data/FTD_Mathys_lv1_res.RData")
+ewce_res <- ewce_expression_output
+
+all_res <-
+  rbind(mutate(ewce_res$Frontal_Cortex$level1_output, tissue = "Frontal Cortex"), 
+        mutate(ewce_res$Temporal_Cortex$level1_output, tissue = "Temporal Cortex")) %>%
+    rbind(mutate(ewce_res$Cerebellum$level1_output, tissue="Cerebellum"))
+
+all_res$CellType <- factor(all_res$CellType, levels=c("Oli", "Opc", "Mic", "Ast", "Ex", "In", "End", "Per"))
+levels(all_res$CellType) <- c("Oligodendrocytes", "Oligodendrocyte\nprogenitor cells", "Microglia", "Astrocytes", "Excitatory neurons", "Inhibitory neurons", "Endothelial cells", "Pericytes")
+
+all_res$tissue <- factor(all_res$tissue, levels=c("Frontal Cortex", "Temporal Cortex", "Cerebellum"))
+
+all_res %>%
+  drop_na(CellType) %>%
+  mutate(nudgex = ifelse(Direction=="Up", 0.3, -0.3)) %>%
+  ggplot(aes(x=CellType, y=abs(sd_from_mean), fill=Direction))+
+  geom_bar(position = "dodge", stat="identity")+
+  geom_text(position=position_dodge(width = 1) , aes(label=ifelse(p==0, "*", ""), y=abs(sd_from_mean)+1.3),  size=5.5)+
+  xlab("Cell type")+
+  ylab("SD from mean")+
+  scale_fill_manual(values=c("#00BFC4", "#F8766D"))+
+  theme_bw()+
+  coord_flip()+
+  ggtitle("EWCE analysis", subtitle="Mathys et al 2019")+
+  theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text=element_text(color="black"),
+      strip.text.x=element_text(color="black"),
+      strip.background=element_blank())+
+  facet_wrap(~tissue)
+
+
+```
+

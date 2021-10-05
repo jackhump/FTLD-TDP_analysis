@@ -1,0 +1,312 @@
+---
+title: "Differential Transcript Usage"
+subtitle: "Gene set enrichment analysis (GSEA)"
+author: "Rahat Hasan"
+date: "June 30, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, include=FALSE, results='hide'}
+library(tidyverse)
+library(clusterProfiler)
+```
+
+```{r include=FALSE}
+
+tissues <- c("Cerebellum", "Frontal_Cortex", "Temporal_Cortex")
+
+named_list_to_df <- function(named_list){
+  map2_df( named_list, names(named_list), ~{
+    tibble( term_id = .y, gene = .x)
+  } )
+}
+
+multi_tissue_de <- function(tissues, disease_comp, model_no){
+  disease_comp <- paste0("_", disease_comp, "_")
+  de_list <- map2(.x=tissues, .y=model_no, ~{
+    load(paste0("../FTD_differential_expression/data/model_designs/", .x, disease_comp, "model_", .y, ".RData"))
+    res <- diff_expr_tables[[1]]
+    res <- res %>% as.data.frame()
+    res <- rownames_to_column(res, "gene_id" )
+  })
+  names(de_list) <- tissues
+
+  return(de_list)
+}
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+de_res <- multi_tissue_de(tissues, disease_comp="allFTD_vs_Control", model_no=c("2", "3", "1"))
+
+gene_meta <- 
+  read_tsv("data/gencode.v30.tx2gene.tsv.gz") %>% 
+  janitor::clean_names() %>%
+  dplyr::rename(isoform_id=txname, gene_id=geneid, gene=genename) %>%
+  mutate(isoform_id=str_split_fixed(isoform_id, "\\.", 2)[,1], gene_id=str_split_fixed(gene_id, "\\.", 2)[,1]) %>%
+  distinct()
+
+load("data/DTU_genes.RData")
+
+dtu_deg_res <- 
+  purrr::map2(
+  .x = de_res,
+  .y = names(de_res), ~{
+  .x$tissue <- .y
+  symbols <- filter(gene_meta, gene_id %in% .x$gene_id)
+  ind <- match(.x$gene_id, symbols$gene_id)
+  .x$genename <- symbols$gene[ind]
+  .x <- filter(.x, genename %in% all_dtu_de[[.y]])
+  return(.x)
+})
+
+dtu_res <- 
+  purrr::map2(
+  .x = de_res,
+  .y = names(de_res), ~{
+  .x$tissue <- .y
+  symbols <- filter(gene_meta, gene_id %in% .x$gene_id)
+  ind <- match(.x$gene_id, symbols$gene_id)
+  .x$genename <- symbols$gene[ind]
+  .x <- filter(.x, genename %in% all_dtu_no_de[[.y]])
+  return(.x)
+})
+
+gene_sets_dtu_deg <- 
+  map_df(dtu_deg_res, ~{.x}) %>%
+  mutate(direction = ifelse( logFC > 0, "up", "down") ) %>%
+  mutate( set = paste(tissue, direction, sep = ":")) %>%
+  split(.$set) %>%
+  map("genename")
+
+gene_sets_dtu <- 
+  map_df(dtu_res, ~{.x}) %>%
+  split(.$tissue) %>%
+  map("genename")
+
+
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+hallmark_file <- "../FTD_gsea/data/h.all.v7.2.symbols.gmt"
+
+hallmarks <- read.gmt(hallmark_file) %>%
+    mutate(term = gsub("HALLMARK|_", " ", term))
+
+
+hallmark_res_deg_dtu <- 
+  map_df(gene_sets_dtu_deg, ~{
+    as.data.frame(enricher(.x, TERM2GENE=hallmarks, pvalueCutoff = 1))
+  }, .id = "set"
+  )
+
+hallmark_res_dtu <- 
+  map_df(gene_sets_dtu, ~{
+    as.data.frame(enricher(.x, TERM2GENE=hallmarks, pvalueCutoff = 1))
+  }, .id = "set"
+  )
+
+```
+
+
+
+```{r fig.height=5, fig.width=9, message=FALSE, warning=FALSE, include=FALSE}
+load("../FTD_deconvolution/data/Mathys_markers.RData")
+mathys_markers_ont <- named_list_to_df(Mathys_markers$full)
+
+
+mathys_res_deg_dtu <- map2_dfr(.x=gene_sets_dtu_deg, .y=names(gene_sets_dtu_deg), .f=~{
+  as.data.frame(enricher(.x, TERM2GENE=mathys_markers_ont, pvalueCutoff = 1)) %>%
+    mutate(set=.y) %>%
+    dplyr::relocate(set)
+  
+  }, .id="set")
+
+mathys_res_dtu <- map2_dfr(.x=gene_sets_dtu, .y=names(gene_sets_dtu), .f=~{
+  as.data.frame(enricher(.x, TERM2GENE=mathys_markers_ont, pvalueCutoff = 1)) %>%
+    mutate(set=.y) %>%
+    dplyr::relocate(set)
+  
+  }, .id="set")
+
+```
+
+
+```{r include=FALSE}
+activation_markers <- read_tsv("../FTD_gsea/data/activation_gene_lists.tsv")
+
+activation_res_deg_dtu <- map2_dfr(.x=gene_sets_dtu_deg, .y=names(gene_sets_dtu_deg), .f=~{
+  if(.y %in% c("Cerebellum:up", "Cerebellum:down")){
+    as.data.frame(enricher(.x, TERM2GENE=dplyr::select(filter(activation_markers, tissue != "Cortex"), -"tissue"), pvalueCutoff = 1)) %>%
+      mutate(set=.y) %>%
+      dplyr::relocate(set)
+  } else {
+    as.data.frame(enricher(.x, TERM2GENE=dplyr::select(filter(activation_markers, tissue != "Cerebellum"), -"tissue"), pvalueCutoff = 1)) %>%
+      mutate(set=.y) %>%
+      dplyr::relocate(set)
+  }
+  }, .id="set")
+
+activation_res_dtu <- map2_dfr(.x=gene_sets_dtu, .y=names(gene_sets_dtu), .f=~{
+  if(.y %in% c("Cerebellum")){
+    as.data.frame(enricher(.x, TERM2GENE=dplyr::select(filter(activation_markers, tissue != "Cortex"), -"tissue"), pvalueCutoff = 1)) %>%
+      mutate(set=.y) %>%
+      dplyr::relocate(set)
+  } else {
+    as.data.frame(enricher(.x, TERM2GENE=dplyr::select(filter(activation_markers, tissue != "Cerebellum"), -"tissue"), pvalueCutoff = 1)) %>%
+      mutate(set=.y) %>%
+      dplyr::relocate(set)
+  }
+  }, .id="set")
+
+
+
+
+```
+
+# DTU enrichments
+```{r echo=TRUE, fig.height=5, fig.width=6, message=FALSE, warning=FALSE}
+mathys_res_dtu <-
+  mathys_res_dtu %>% as.tibble() %>%
+  dplyr::select(set, ID, p.adjust) %>%
+  mutate(category="Cell-types") 
+
+
+hallmark_res_dtu <-
+  hallmark_res_dtu %>% as.tibble() %>%
+  dplyr::select(set, ID, p.adjust) %>%
+  mutate(category="Pathways") 
+
+activation_res_dtu <-
+  activation_res_dtu %>% as.tibble() %>%
+  dplyr::select(set, ID, p.adjust) %>% 
+  mutate(category="Glial activation") 
+
+
+all_res_dtu <- 
+  rbind(hallmark_res_dtu, mathys_res_dtu) %>%
+  rbind(activation_res_dtu) %>%
+  mutate(ID=as.character(ID)) %>%
+  group_by(category) %>%
+  arrange(p.adjust, .by_group = TRUE)
+
+all_res_dtu$ID <- factor(all_res_dtu$ID, levels=rev(unique(all_res_dtu$ID)))
+all_res_dtu$set <- factor(all_res_dtu$set, levels=c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum"))
+
+dtu_labels <- rev(c("Inhibitory\nneurons", "Oligodendrocyte\nprogenitorcells", "Disease-associated astrocytes", "Disease-associated microglia", "Mitotic spindle", "MYC targets", "Protein secretion", "UV response", "Apical junction", "PI3K MTOR signaling", "Myogenesis", "Oxidative phosphorylation", "Adipogenesis"))
+
+all_res_dtu %>%
+  filter(!ID %in% c("  HEME METABOLISM", "  UV RESPONSE UP", "  CHOLESTEROL HOMEOSTASIS", "  DNA REPAIR", "  ANDROGEN RESPONSE", "  MTORC1 SIGNALING", "  HEDGEHOG SIGNALING")) %>% #These terms are ns in all regions
+  ggplot(aes(x=set, y=as.factor(ID), fill=-log(as.numeric(p.adjust))))+
+  geom_tile()+
+  theme_bw()+
+    scale_fill_gradient2(low="white", high="deepskyblue3", aesthetics="fill", na.value="gray")+
+    scale_x_discrete(expand=c(0,0), position="top")+ 
+    scale_y_discrete(expand=c(0,0), labels=dtu_labels)+
+    geom_text(aes(label=ifelse(p.adjust<0.05, "*", 
+                               ifelse(p.adjust<0.01, "**", 
+                                      ifelse(p.adjust<0.001, "***", "")))), size=5)+
+    xlab(NULL)+
+    ylab(NULL)+
+  ggtitle("DTU")+
+  labs(fill="-log(P.adjust)")+
+  theme(
+    legend.key.size = unit(0.5, "cm"),
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    panel.border=element_rect(color="black", fill=NA, size=0.5),
+    axis.text=element_text(color="black"),
+    panel.background=element_rect(fill="gray90"))
+#save(all_res_dtu, file="dtu_enrichment_res.RData")
+```
+# DEG-DTU enrichments
+```{r fig.height=2, fig.width=5.5, message=FALSE, warning=FALSE}
+mathys_res_deg_dtu <-
+  mathys_res_deg_dtu %>% as.tibble() %>%
+  dplyr::select(set, ID, p.adjust) %>% 
+  mutate(direction=ifelse(grepl("up", set), "Up", "Down")) %>%
+  mutate(category="Cell types")
+
+
+hallmark_res_deg_dtu <-
+  hallmark_res_deg_dtu %>% as.tibble() %>%
+  dplyr::select(set, ID, p.adjust) %>% 
+  mutate(direction=ifelse(grepl("up", set), "Up", "Down")) %>%
+  mutate(category="Pathways")
+
+activation_res_deg_dtu <-
+  activation_res_deg_dtu %>% as.tibble() %>%
+  dplyr::select(set, ID, p.adjust) %>% 
+  mutate(direction=ifelse(grepl("up", set), "Up", "Down")) %>%
+  mutate(category="Glial activation")
+
+all_res_deg_dtu <- 
+  rbind(hallmark_res_deg_dtu, mathys_res_deg_dtu) %>% rbind(activation_res_deg_dtu) %>%
+  mutate(ID=as.character(ID)) %>%
+  mutate(direction=set) %>%
+  mutate(set=ifelse(grepl("Frontal_Cortex", direction), "Frontal_Cortex",
+                    ifelse(grepl("Temporal_Cortex", direction), "Temporal_Cortex", "Cerebellum"))) %>%
+  group_by(category) %>%
+  arrange(p.adjust, .by_group = TRUE) 
+  
+all_res_deg_dtu$ID <- factor(all_res_deg_dtu$ID, levels=rev(unique(all_res_deg_dtu$ID)))
+all_res_deg_dtu$set <- factor(all_res_deg_dtu$set, levels=c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum"))
+all_res_deg_dtu$direction <- factor(all_res_deg_dtu$direction, levels=c("Up", "Down"))
+
+deg_dtu_labels <- rev(c("Inhibitory\nneurons", "Oligodendrocyte\nprogenitor cells", "Cholesterol homeostasis", "Mitotic spindle"))
+
+all_res_deg_dtu %>%
+  filter(ID %in% c("In", "Opc", "  CHOLESTEROL HOMEOSTASIS", "  MITOTIC SPINDLE")) %>%
+ ggplot(aes(x=set, y=ID, fill=-log(as.numeric(p.adjust))))+
+  geom_tile()+
+  theme_bw()+
+  scale_fill_gradient2(low="white", high="deepskyblue3", aesthetics="fill", na.value="gray")+
+  scale_x_discrete(expand=c(0,0), position="top")+ 
+  scale_y_discrete(expand=c(0,0), labels=deg_dtu_labels)+
+  geom_text(aes(label=ifelse(p.adjust<0.05, "*", 
+                             ifelse(p.adjust<0.01, "**", 
+                                    ifelse(p.adjust<0.001, "***", "")))), size=5)+
+  xlab(NULL)+
+  ylab(NULL)+
+  labs(fill="-log(P.adjust)")+
+  ggtitle("DTU-DEG")+
+  theme(
+  panel.grid.major=element_blank(),
+  panel.grid.minor=element_blank(),
+  axis.text=element_text(color="black"),
+  panel.border=element_rect(color="black", fill=NA, size=0.5),
+  panel.background=element_rect(fill="gray90"))
+
+#save(all_res_deg_dtu, file="deg_dtu_enrichment_res.RData")
+  
+
+```
+
+
+
+
+
+
+
