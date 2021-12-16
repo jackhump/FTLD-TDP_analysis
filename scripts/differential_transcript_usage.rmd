@@ -1,0 +1,731 @@
+---
+title: "Differential Transcript Usage"
+author: "Rahat Hasan"
+date: "June 1, 2021"
+output:   
+  rmarkdown::html_document:
+     theme: united
+     highlight: tango
+     code_folding: show
+     toc: true
+     toc_float: true
+     df_print: paged
+     smooth_scroll: true
+     number_sections: false
+     self_contained: true  
+---
+<style>
+    body .main-container {
+        max-width: 1400px;
+    }
+    
+  caption {
+    color: black;
+    font-size: 1.5em;
+  } 
+</style>
+
+```{r load.packages, message=FALSE, include=FALSE, results='hide'}
+library(tidyverse)
+library(satuRn)
+library(SummarizedExperiment)
+library(edgeR)
+library(ggrepel)
+library(RColorBrewer)
+library(VennDiagram)
+library(png)
+library(gdata)
+library(ggpmisc)
+library(ggpubr)
+library(ggbio)
+library(ggplot2)
+library(rtracklayer)
+library(ComplexHeatmap)
+library(ggvenn)
+library(UpSetR)
+library(readxl)
+library(patchwork)
+```
+
+```{r eval=FALSE, include=FALSE}
+
+combine_metrics <- function(t, cat=TRUE){  
+  ##Combines clinical and technical metrics into one dataframe. 'cat'=TRUE/FALSE includes or excludes categoricals
+  inFile <- paste0("../FTD_differential_expression/data/support/", t, ".RData")
+  #stopifnot(file.exists(inFile))
+  load(inFile)
+  
+  row.names(support_loc) <- support_loc$sample
+  row.names(tech_loc) <- tech_loc$sample
+  
+  libsize <- enframe(colSums(counts_loc)) %>% dplyr::rename(sample = name, total_counts = value) 
+  
+  support <- dplyr::left_join(support_loc, libsize, by = 'sample')
+  
+  if(cat==FALSE){
+    support <- dplyr::select(support_loc, sample, disease, where(is.numeric))
+  }
+  
+  tech_loc <- dplyr::select(tech_loc, sample, where(is.numeric))
+  
+  metric_df <- left_join(support_loc, tech_loc, by = c("sample"="sample"))
+  metric_df <- metric_df[, colSums(is.na(metric_df)) != nrow(metric_df)]
+  metric_df <- metric_df[, apply(metric_df, 2, function(x) replace_na(sd(x)>0, TRUE))] 
+  
+  return(metric_df)
+}
+```
+
+
+```{r eval=FALSE, include=FALSE}
+# satuRN implementation
+tx_tpm <- read_tsv("../FTD_dtu/data/transcript_matrices/UCL_tx_TPM.tsv")
+tx_counts <- read_tsv("../FTD_dtu/data/transcript_matrices/UCL_tx_counts.tsv")
+
+names(tx_counts) <- gsub(".isoforms.results", "", names(tx_counts))
+
+
+support <- combine_metrics("Frontal_Cortex") %>%
+  rbind(combine_metrics("Temporal_Cortex")) %>%
+  rbind(combine_metrics("Cerebellum")) %>%
+  filter(sample != "CGND-HRA-00999") # Outlier
+
+tx_counts <- 
+  dplyr::select(tx_counts, transcript, support$sample) %>%
+  column_to_rownames("transcript")
+
+gene_meta <- 
+  read_tsv(here::here("../FTD_dtu/data/gencode.v30.tx2gene.tsv.gz")) %>% 
+  janitor::clean_names() %>%
+  dplyr::rename(isoform_id=txname, gene_id=geneid, gene=genename) %>%
+  mutate(isoform_id=str_split_fixed(isoform_id, "\\.", 2)[,1], gene_id=str_split_fixed(gene_id, "\\.", 2)[,1]) %>%
+  distinct()
+
+txInfo <- gene_meta %>%
+  dplyr::select(-gene) 
+
+rownames(txInfo) <- txInfo$isoform_id
+
+txInfo <- txInfo[txInfo$isoform_id %in% rownames(tx_counts), ]
+txInfo <- subset(txInfo, 
+                 duplicated(gene_id) | duplicated(gene_id, fromLast = TRUE))
+
+tx_counts <- tx_counts[which(
+  rownames(tx_counts) %in% txInfo$isoform_id), ]
+
+
+# Katia's tx filter
+cpm = cpm(tx_counts)
+keep_exp = rowSums(cpm > 1) >= 0.3*ncol(tx_counts) 
+
+#table(filter_edgeR)
+
+tx_counts <- tx_counts[keep_exp, ]
+
+# Update txInfo according to the filtering procedure
+txInfo <- txInfo[which(
+  txInfo$isoform_id %in% rownames(tx_counts)), ]
+# remove txs that are the only isoform expressed within a gene (after filtering)
+txInfo <- subset(txInfo, 
+                 duplicated(gene_id) | duplicated(gene_id, fromLast = TRUE))
+tx_counts <- tx_counts[which(rownames(
+  tx_counts) %in% txInfo$isoform_id), ]
+
+# for testing
+# tx_counts <- tx_counts[1:5000,]
+tx_counts <- floor(tx_counts)
+
+# satuRn requires the transcripts in the rowData and 
+# the transcripts in the count matrix to be in the same order.
+txInfo <- txInfo[match(rownames(tx_counts), txInfo$isoform_id), ]
+
+# calculate transcript ratios for all transcripts tested
+tx_ratio <- 
+  map_df(unique(txInfo$gene_id),  ~{
+    df <- tx_counts[ txInfo$gene_id == .x,]
+    ratios <- sweep(df, MARGIN = 2, STATS =  colSums(df), FUN = "/")
+    return(ratios)
+  })
+
+length(unique(txInfo$gene_id))
+length(unique(txInfo$isoform_id))
+# 11,193 genes
+# 47,382 isoforms
+
+support$group <- as.factor(paste(support$tissue, support$disease, sep = "."))
+## Generate SummarizedExperiment
+sumExp <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(counts = tx_counts),
+  colData = support,
+  rowData = txInfo
+)
+
+# specify design formula from colData
+metadata(sumExp)$formula <- ~ 0 + colData(sumExp)$group + sumExp$age + sumExp$median_3prime_bias + sumExp$pct_ribosomal_bases + as.factor(sumExp$sex)
+
+#sumExp
+
+# fit model - takes a few minutes
+system.time({
+  sumExp <- satuRn::fitDTU(
+    object = sumExp,
+    formula = ~ 0 + sumExp$group + sumExp$age + sumExp$median_3prime_bias + sumExp$pct_ribosomal_bases + sumExp$sex,
+    parallel = FALSE,
+    BPPARAM = BiocParallel::bpparam(),
+    verbose = TRUE
+  )
+})
+
+# create contrasts
+
+design <- model.matrix(~ 0 + sumExp$group + sumExp$age + sumExp$sex + sumExp$pct_ribosomal_bases + sumExp$median_3prime_bias) # construct design matrix
+
+colnames(design) <- c(levels(sumExp$group), "age", "sex", "pct_ribosomal_bases", "median_3prime_bias")
+
+L <- limma::makeContrasts(
+  Contrast1 = Cerebellum.Control - Cerebellum.FTD,
+  Contrast2 = Frontal_Cortex.Control - Frontal_Cortex.FTD,
+  Contrast3 = Temporal_Cortex.Control - Temporal_Cortex.FTD,
+  levels = design
+)
+
+# perform DTU
+sumExp <- satuRn::testDTU(
+  object = sumExp,
+  contrasts = L,
+  plot = FALSE,
+  sort = TRUE
+)
+
+all_res <- 
+  list(
+  fc = rowData(sumExp)[["fitDTUResult_Contrast1"]],
+  tc = rowData(sumExp)[["fitDTUResult_Contrast2"]],
+  cb = rowData(sumExp)[["fitDTUResult_Contrast3"]]
+  ) %>%
+  map( ~{
+      rownames_to_column(.x, var = "isoform_id") %>% 
+      left_join(gene_meta, by = "isoform_id") %>%
+      tibble() }
+      )
+
+```
+
+```{r include=FALSE}
+#Construct volcano plots from the DTU results
+volcanoPlot <- function(res){
+  arrange(res, empirical_FDR) %>% 
+  mutate(fdr=ifelse(regular_FDR<0.05, "\u22645%", ">5%")) %>%
+  drop_na(fdr) %>%
+  ggplot( aes(x=estimates, y=-log(regular_FDR, 10)))+
+  geom_hline(yintercept=1.3, linetype="dashed")+
+  geom_point(aes(color=fdr))+
+  xlab("transcript usage")+
+  ylab(expression(paste("-log"[10], "(regular FDR)")))+
+  scale_color_manual(values=c("orange", "dodgerblue"), name="FDR")+
+  theme_bw()
+  
+}
+
+
+```
+
+```{r include=FALSE}
+#For each tissue, find the genes that are differentially expressed (DEG) AND have differential transcript usage (DTU).
+load("data/allres_saturn_dtu_clinical_cov.RData")
+
+gene_meta <- 
+  read_tsv("../FTD_dtu/data/gencode.v30.tx2gene.tsv.gz") %>% 
+  janitor::clean_names() %>%
+  dplyr::rename(isoform_id=txname, gene_id=geneid, gene=genename) %>%
+  mutate(isoform_id=str_split_fixed(isoform_id, "\\.", 2)[,1], gene_id=str_split_fixed(gene_id, "\\.", 2)[,1]) %>%
+  distinct()
+
+#Frontal Cortex
+fc_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene) %>%
+  dplyr::select(gene) %>%
+  unlist()
+
+fc_dtu_genes <- all_res$fc %>% filter(regular_FDR < 0.05) %>% dplyr::select(gene) %>% distinct(gene) %>% unlist() #All DTU genes
+fc_dtu_degs <- intersect(fc_dtu_genes, fc_degs) # DEG + DTU genes
+fc_dtu_no_degs <- setdiff(fc_dtu_genes, fc_dtu_degs) # DTU but not DEG
+
+
+#Temporal Cortex
+tc_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene) %>%
+  dplyr::select(gene) %>%
+  unlist()
+
+tc_dtu_genes <- all_res$tc %>% filter(regular_FDR < 0.05) %>% dplyr::select(gene) %>% distinct(gene) %>% unlist()
+tc_dtu_degs<- intersect(tc_dtu_genes, tc_degs)
+tc_dtu_no_degs <- setdiff(tc_dtu_genes, tc_dtu_degs)
+
+
+#Cerebellum
+cb_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Cerebellum_allFTD_vs_Control_model_2.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene) %>%
+  dplyr::select(gene) %>%
+  unlist()
+
+cb_dtu_genes <- all_res$cb %>% filter(regular_FDR < 0.05) %>% dplyr::select(gene) %>% distinct(gene) %>% unlist()
+cb_dtu_degs <- intersect(cb_dtu_genes, cb_degs)
+cb_dtu_no_degs <- setdiff(cb_dtu_genes, cb_dtu_degs)
+
+
+all_dtu_de <- list("Frontal_Cortex"=fc_dtu_degs, "Temporal_Cortex"=tc_dtu_degs, "Cerebellum"=cb_dtu_degs)
+all_dtu_no_de <- list("Frontal_Cortex"=fc_dtu_no_degs, "Temporal_Cortex"=tc_dtu_no_degs, "Cerebellum"=cb_dtu_no_degs)
+all_degs <- list("Frontal_Cortex"=fc_degs, "Temporal_Cortex"=tc_degs, "Cerebellum"=cb_degs)
+all_dtu <- list("Frontal_Cortex"=fc_dtu_genes, "Temporal_Cortex"=tc_dtu_genes, "Cerebellum"=cb_dtu_genes)
+#save(all_dtu_de, all_dtu_no_de, all_degs, all_dtu, file="data/DTU_genes.RData")
+
+
+```
+
+# Volcano Plots {.tabset}
+
+## Frontal Cortex {.tabset .tabset-pills}
+2630 DTU genes (regular FDR < 0.05)
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+volcanoPlot(all_res$fc)
+```
+
+## Temporal Cortex {.tabset .tabset-pills}
+2891 DTU genes (regular FDR < 0.05)
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+volcanoPlot(all_res$tc)
+```
+
+## Cerebellum {.tabset .tabset-pills}
+4045 DTU genes (regular FDR < 0.05)
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+volcanoPlot(all_res$cb)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+fc_control <- rownames(colData(sumExp))[colData(sumExp)$group == "Frontal_Cortex.Control"]
+fc_ftd <- rownames(colData(sumExp))[colData(sumExp)$group == "Frontal_Cortex.FTD"]
+
+plotDTU(object=sumExp, contrast = "Contrast1", groups=list("Control"=fc_control, "FTD"=fc_ftd), coefficients=list(c(0,0,1,0,0,0,0,0), c(0,0,0,1,0,0,0,0)), summaryStat = "model", top.n=10 )
+
+tc_control <- rownames(colData(sumExp))[colData(sumExp)$group == "Temporal_Cortex.Control"]
+tc_ftd <- rownames(colData(sumExp))[colData(sumExp)$group == "Temporal_Cortex.FTD"]
+
+plotDTU(object=sumExp, contrast = "Contrast2", groups=list("Control"=tc_control, "FTD"=tc_ftd), coefficients=list(c(0,0,0,0,1,0,0,0), c(0,0,0,0,0,1,0,0)), summaryStat = "model", top.n=10 )
+
+cb_control <- rownames(colData(sumExp))[colData(sumExp)$group == "Cerebellum.Control"]
+cb_ftd <- rownames(colData(sumExp))[colData(sumExp)$group == "Cerebellum.FTD"]
+
+plotDTU(object=sumExp, contrast = "Contrast3", groups=list("Control"=cb_control, "FTD"=cb_ftd), coefficients=list(c(1,0,0,0,0,0,0,0), c(0,1,0,0,0,0,0,0)), summaryStat = "model", top.n=10 )
+
+```
+
+
+# UNC13B, TARDBP, HNRNPK
+
+## Transcript Usage
+```{r echo=TRUE, fig.width=14, fig.height=6, message=FALSE, warning=FALSE}
+
+all_res_df <-
+  map2_dfr(.x=all_res, .y=names(all_res), .f=~{
+  df <- mutate(.x, tissue=.y)
+  return(df)
+})
+
+
+all_res_df <- mutate(all_res_df, tissue=ifelse(tissue=="fc", "FC",
+                                               ifelse(tissue=="tc", "TC", "CB")))
+
+all_res_df$tissue <- factor(all_res_df$tissue, levels=c("FC", "TC", "CB"))
+
+all_res_df <- all_res_df %>% arrange(estimates)
+all_res_df$isoform_id <- factor(all_res_df$isoform_id, levels=unique(all_res_df$isoform_id))
+
+dtu_plotter <- function(gene_name, limits=NULL, legend_position="none"){
+  dtu_plot <-
+    all_res_df %>%
+    filter(gene == gene_name) %>%
+    ggplot(aes(x=tissue, y=isoform_id, fill=estimates))+
+    geom_tile()+
+    geom_text(aes(label=ifelse(regular_FDR<0.05, "*", "")))+
+    ggtitle(gene_name)+
+    xlab(NULL)+
+    ylab(NULL)+
+    labs(fill="transcript usage")+
+    scale_fill_gradient2(low="dodgerblue", mid="white", high="red", midpoint=0, aesthetics="fill", guide="colourbar", na.value="gray85", lim=limits)+
+    scale_x_discrete(expand=c(0,0), position="top", labels=c("Frontal_Cortex", "Temporal_Cortex", "Cerebellum"))+ 
+    scale_y_discrete(expand=c(0,0))+
+    theme_bw()+
+    theme(
+      legend.position=legend_position,
+      legend.key.size = unit(0.65, "cm"),
+      panel.grid.major=element_blank(),
+      panel.grid.minor=element_blank(),
+      panel.border=element_rect(color="black", fill=NA, size=0.5),
+      axis.text.x=element_text(color="black"),
+      axis.text.y=element_text(color="black"),
+      plot.title = element_text(face="italic"),
+      panel.background=element_rect(fill="gray90"),
+      panel.spacing = unit(0, "npc"),
+      strip.background=element_blank(),
+      strip.text.x=element_blank(),
+      strip.placement="right")
+  
+  return(dtu_plot)
+}
+
+dtu_plotter("UNC13B")+ dtu_plotter("TARDBP", limits=c(-1,1)) + dtu_plotter("HNRNPK", limits=c(-1,1), "right")
+
+
+```
+
+## Transcript Alignment plots {.tabset}
+```{r echo=TRUE, fig.width=15, fig.height=5,  message=FALSE, warning=FALSE}
+# Jack Humphrey 2021
+gencode_gff <- import("data/gencode.v37.annotation.gtf.gz", format = "GTF")
+
+gencode_plot <- function(genename, isoforms){
+  gff_loc <- gencode_gff[ gencode_gff$gene_name == genename]
+  gff_loc <- gff_loc[ gff_loc$type %in% c("exon", "CDS", "UTR")]
+  chr_label <-  unique(as.character(GenomicRanges::seqnames(gff_loc) ) )
+  #tx <- unique(gff_loc$transcript_id)
+  tx <- isoforms
+  gff_loc$transcript_id <- factor(gff_loc$transcript_id, levels = rev(tx) )
+  gff_loc$transcript_type <- gsub("_", " ", gff_loc$transcript_type)
+  ggplot() + 
+    geom_alignment(gff_loc,range.geom = "rect", gap.geom = "arrow", which = NULL, size = 0.1,
+                   aes(group = transcript_id, fill = transcript_type), colour = NA, 
+                   truncate.gaps = TRUE) + 
+    theme_classic() + 
+    theme(legend.position="none")+
+    labs(fill = "Transcript type", x = chr_label  ) + theme(axis.text = element_text(colour = "black") )
+}
+
+```
+
+### UNC13B {.tabset .tabset-pills}
+```{r}
+unc13b_isoforms <- c("ENST00000619578.4", "ENST00000378495.7", "ENST00000617908.4", "ENST00000636694.1")
+gencode_plot("UNC13B", unc13b_isoforms)
+```
+
+### TARDBP {.tabset .tabset-pills}
+```{r}
+tardbp_isoforms <- c("ENST00000629725.2", "ENST00000240185.8", "ENST00000621715.4", "ENST00000639083.1", "ENST00000439080.6", "ENST00000613864.4", "ENST00000621573.1", "ENST00000315091.7")
+gencode_plot("TARDBP", tardbp_isoforms)
+```
+
+### HNRNPK {.tabset .tabset-pills}
+```{r}
+hnrnpk_isoforms <- c("ENST00000376263.8", "ENST00000360384.9", "ENST00000351839.7", "ENST00000472778.5", "ENST00000457156.5", "ENST00000493362.1","ENST00000492865.1", "ENST00000481820.6", "ENST00000376281.8", "ENST00000483135.1", "ENST00000376256.2")
+gencode_plot("HNRNPK", hnrnpk_isoforms)
+```
+
+
+# TDP-43 Knockdown comparisons
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+fc_genes <- 
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  mutate(diff_expr=ifelse(adj.P.Val < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$gene_id})
+
+tc_genes <- 
+  load("../FTD_differential_expression/data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  mutate(diff_expr=ifelse(adj.P.Val < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$gene_id})
+  #.$gene_id
+
+cb_genes <- 
+  load("../FTD_differential_expression/data/model_designs/Cerebellum_allFTD_vs_Control_model_2.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  mutate(diff_expr=ifelse(adj.P.Val < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$gene_id})
+
+tdp_ko_genes <-
+  read_csv("data/de_i3_with_cryptic_flag.csv") %>%
+  mutate(diff_expr=ifelse(padj < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$ensgene})
+
+tdp_ce_genes <-
+  read_csv("data/de_i3_with_cryptic_flag.csv") %>%
+  mutate(cryptic=ifelse(contains_cryptic == TRUE, "CE", "non-CE")) %>%
+  split(.$cryptic) %>%
+  map(.x=., .f=~{.x$ensgene})
+```
+
+## Overlaps between FTLD-TDP DEGs and TDP-43 KO DEGs {.tabset}
+```{r overlap test, echo=TRUE, message=FALSE, warning=FALSE}
+# Function for testing significance of overlap
+overlap_test <- function(ftd_genes, tdp_ko_genes){
+
+  overlaps <- 
+    c(
+    length(intersect(ftd_genes[[1]], tdp_ko_genes[[1]])), 
+    length(intersect(ftd_genes[[1]], tdp_ko_genes[[2]])),
+    length(intersect(ftd_genes[[2]], tdp_ko_genes[[1]])),
+    length(intersect(ftd_genes[[2]], tdp_ko_genes[[2]]))
+    )
+  contingency_table <- matrix(overlaps, nrow=2, ncol=2)
+  #We are testing for overrepresentation of the TDP-43 KO genes, so set alternative=greater.
+  fisher.test(contingency_table, alternative="greater") %>% print()
+  
+  print(contingency_table)
+
+}
+```
+
+### Frontal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+overlap_test(fc_genes, tdp_ko_genes)
+ggvenn(list("FTLD-TDP"=fc_genes$DEG, "TDP-43 KO"=tdp_ko_genes$DEG), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+### Temporal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+overlap_test(tc_genes, tdp_ko_genes)
+ggvenn(list("FTLD-TDP"=tc_genes$DEG, "TDP-43 KO"=tdp_ko_genes$DEG), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+### Cerebellum {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+overlap_test(cb_genes, tdp_ko_genes)
+ggvenn(list("FTLD-TDP"=cb_genes$DEG, "TDP-43 KO"=tdp_ko_genes$DEG), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+### LogFC Correlations 
+```{r echo=TRUE, fig.height=4, fig.width=10, message=FALSE, warning=FALSE}
+fc_logfc<- 
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  mutate(tissue = "Frontal Cortex") %>%
+  dplyr::select(gene_id, logFC, tissue)
+
+tc_logfc <- 
+  load("../FTD_differential_expression/data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  mutate(tissue = "Temporal Cortex") %>%
+  dplyr::select(gene_id, logFC, tissue)
+
+cb_logfc <- 
+  load("../FTD_differential_expression/data/model_designs/Cerebellum_allFTD_vs_Control_model_2.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  mutate(tissue = "Cerebellum") %>%
+  dplyr::select(gene_id, logFC, tissue)
+
+tdp_ko_logfc <-
+  read_csv("data/de_i3_with_cryptic_flag.csv") %>%
+  dplyr::select(ensgene, log2FoldChange)
+
+all_logfc <- 
+  rbind(fc_logfc, tc_logfc) %>%
+  rbind(cb_logfc) %>% 
+  left_join(tdp_ko_logfc, by=c("gene_id"="ensgene")) %>%
+  drop_na() %>%
+  dplyr::rename(`FTLD-TDP`="logFC", `TDP-43 KO`="log2FoldChange")
+
+all_logfc$tissue <- factor(all_logfc$tissue, levels=c("Frontal Cortex", "Temporal Cortex", "Cerebellum"))
+  
+ggplot(all_logfc, aes(x=`FTLD-TDP`, y=`TDP-43 KO`))+
+  geom_smooth(method=lm, se=FALSE)+
+  geom_hline(linetype="dashed", yintercept=0)+
+  geom_vline(linetype="dashed", xintercept=0)+
+  geom_hex(bins=100, show.legend=TRUE)+
+  stat_cor(method="pearson", label.x.npc=0.02, label.y.npc=0.97, size=3.5)+
+  scale_x_continuous(limits=symmetric_limits)+
+  scale_fill_continuous(type="viridis")+
+  xlab("FTLD-TDP vs Control")+
+  ylab("TDP-43 KO vs Control")+
+  facet_wrap(~tissue, scales="free_y")+
+  theme_bw()+
+  theme(
+      panel.border = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(size=9, face="bold"),
+      axis.line=element_line(color="black", size=0.5),
+      axis.text=element_text(color="black"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank())
+
+```
+
+## Overlaps between FTLD-TDP DTU genes and TDP-43 KO cryptic exon genes {.tabset}
+
+### Frontal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+load("data/allres_saturn_dtu_clinical_cov.RData")
+
+fc_dtu_sig <- all_res$fc %>% filter(regular_FDR<0.05) %>% .$gene_id %>% unique()
+fc_dtu_ns <- all_res$fc %>% filter(regular_FDR>0.05) %>% .$gene_id %>% unique()
+fc_dtu = list("gDTU"=fc_dtu_sig, "NS"=fc_dtu_ns)
+
+overlap_test(fc_dtu, tdp_ce_genes)
+ggvenn(list("gDTU"=fc_dtu$gDTU, "CE"=tdp_ce_genes$CE), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+
+```
+
+### Temporal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+tc_dtu_sig <- all_res$tc %>% filter(regular_FDR<0.05) %>% .$gene_id %>% unique()
+tc_dtu_ns <- all_res$tc %>% filter(regular_FDR>0.05) %>% .$gene_id %>% unique()
+tc_dtu = list("gDTU"=tc_dtu_sig, "NS"=tc_dtu_ns)
+
+overlap_test(tc_dtu, tdp_ce_genes)
+ggvenn(list("gDTU"=tc_dtu$gDTU, "CE"=tdp_ce_genes$CE), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+### Cerebellum {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+cb_dtu_sig <- all_res$cb %>% filter(regular_FDR<0.05) %>% .$gene_id %>% unique()
+cb_dtu_ns <- all_res$tc %>% filter(regular_FDR>0.05) %>% .$gene_id %>% unique()
+cb_dtu = list("gDTU"=cb_dtu_sig, "NS"=cb_dtu_ns)
+
+overlap_test(cb_dtu, tdp_ce_genes)
+ggvenn(list("gDTU"=cb_dtu$gDTU, "CE"=tdp_ce_genes$CE), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+# TDP-43 overexpression comparisons 
+```{r}
+tdp_overexpr <- 
+  read_excel("data/41467_2018_5049_MOESM5_ESM.xlsx",  sheet=2) 
+
+tdp_overexpr_genes <-
+  tdp_overexpr %>%
+  mutate(TDP43OE_vs_CTL_stability_significant=ifelse(TDP43OE_vs_CTL_stability_significant== TRUE, "destabilized", "stabilized")) %>%
+  split(.$TDP43OE_vs_CTL_stability_significant) %>%
+  map(.x=., .f=~{.x$gene_name})
+```
+
+## Overlaps between FTLD-TDP DTU genes and TDP-43 overexpression genes {.tabset}
+
+### Frontal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+load("data/allres_saturn_dtu_clinical_cov.RData")
+
+fc_dtu_sig <- all_res$fc %>% filter(regular_FDR<0.05) %>% .$gene %>% unique()
+fc_dtu_ns <- all_res$fc %>% filter(regular_FDR>0.05) %>% .$gene %>% unique()
+fc_dtu = list("gDTU"=fc_dtu_sig, "NS"=fc_dtu_ns)
+
+overlap_test(fc_dtu, tdp_overexpr_genes)
+ggvenn(list("gDTU"=fc_dtu$gDTU, "Destabilized"=tdp_overexpr_genes$destabilized), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+
+```
+
+### Temporal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+tc_dtu_sig <- all_res$tc %>% filter(regular_FDR<0.05) %>% .$gene %>% unique()
+tc_dtu_ns <- all_res$tc %>% filter(regular_FDR>0.05) %>% .$gene %>% unique()
+tc_dtu = list("gDTU"=tc_dtu_sig, "NS"=tc_dtu_ns)
+
+overlap_test(tc_dtu, tdp_overexpr_genes)
+ggvenn(list("gDTU"=tc_dtu$gDTU, "Destabilized"=tdp_overexpr_genes$destabilized), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+### Cerebellum {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+cb_dtu_sig <- all_res$cb %>% filter(regular_FDR<0.05) %>% .$gene %>% unique()
+cb_dtu_ns <- all_res$tc %>% filter(regular_FDR>0.05) %>% .$gene  %>% unique()
+cb_dtu = list("gDTU"=cb_dtu_sig, "NS"=cb_dtu_ns)
+
+overlap_test(cb_dtu, tdp_overexpr_genes)
+ggvenn(list("gDTU"=cb_dtu$gDTU, "Destabilized"=tdp_overexpr_genes$destabilized), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
+## Overlaps between FTLD-TDP DEGs and TDP-43 overexpression genes {.tabset}
+
+### Frontal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+fc_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Frontal_Cortex_allFTD_vs_Control_model_3.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  #filter(adj.P.Val < 0.05) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene, .keep_all=TRUE) %>%
+  mutate(diff_expr=ifelse(adj.P.Val < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$gene})
+
+overlap_test(fc_degs, tdp_overexpr_genes)
+ggvenn(list("FTLD-TDP"=fc_dtu$gDTU, "Destabilized"=tdp_overexpr_genes$destabilized), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+
+```
+
+### Temporal Cortex {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+tc_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Temporal_Cortex_allFTD_vs_Control_model_1.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene, .keep_all=TRUE) %>%
+  mutate(diff_expr=ifelse(adj.P.Val < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$gene})
+
+overlap_test(tc_degs, tdp_overexpr_genes)
+ggvenn(list("FTLD-TDP"=tc_dtu$gDTU, "Destabilized"=tdp_overexpr_genes$destabilized), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+
+```
+
+### Cerebellum {.tabset .tabset-pills}
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+cb_degs <- 
+  load("../FTD_differential_expression/data/model_designs/Cerebellum_allFTD_vs_Control_model_2.RData") %>%
+  get() %>%
+  .[[1]] %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_meta, by="gene_id") %>%
+  distinct(gene, .keep_all=TRUE) %>%
+  mutate(diff_expr=ifelse(adj.P.Val < 0.05, "DEG", "NS")) %>%
+  split(.$diff_expr) %>%
+  map(.x=., .f=~{.x$gene})
+
+overlap_test(cb_degs, tdp_overexpr_genes)
+ggvenn(list("FTLD-TDP"=cb_dtu$gDTU, "Destabilized"=tdp_overexpr_genes$destabilized), fill_color=c("#f28947", "#00858e"), show_percentage=FALSE, text_size=6, set_name_size=6)
+```
+
